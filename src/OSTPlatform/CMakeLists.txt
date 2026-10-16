@@ -47,7 +47,10 @@ target_link_libraries(OSTPlatform PRIVATE
     detours
 )
 
-# Logging is compiled in only for Debug; Release reduces OSTP_LOG_* to no-ops.
-target_compile_definitions(OSTPlatform PRIVATE
-    $<$<CONFIG:Debug>:OPENSTEAMTOOL_LOGGING_ENABLED>
+target_compile_definitions(OSTPlatform
+    PUBLIC
+        NOMINMAX
+    PRIVATE
+        WIN32_LEAN_AND_MEAN
+        $<$<CONFIG:Debug>:STEAMDADDY_LOGGING_ENABLED>
 )
