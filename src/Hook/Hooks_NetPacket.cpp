@@ -6,6 +6,7 @@
 #include "Utils/Tickets/AppTicket.h"
 #include "Utils/Tickets/EticketClient.h"
 #include "Utils/Support/FnvHash.h"
+#include "Utils/Config/Config.h"
 #include "Utils/CloudRedirect/CloudRedirectHost.h"
 #include <chrono>
 #include <cstdio>
@@ -76,8 +77,8 @@ namespace {
 
         eMsg  = static_cast<EMsg>(hdr->eMsg & ~kMsgHdrProtoFlag);
         cbHdr = hdr->headerLength;
-        if (cbHdr > size - sizeof(MsgHdr)) goto fail;
         uint32 off = sizeof(MsgHdr) + cbHdr;
+        if (off > size) goto fail;
         pHdr   = data + sizeof(MsgHdr);
         pBody  = data + off;
         cbBody = size - off;
@@ -89,9 +90,8 @@ namespace {
                                   const uint8* pNewHdr, uint32 cbNewHdr,
                                   const uint8* pNewBody, uint32 cbNewBody)
     {
-        constexpr uint32 kMaxPayload = sizeof(g_RecvPacketPool[0]) - sizeof(MsgHdr);
-        if (cbNewHdr > kMaxPayload || cbNewBody > kMaxPayload - cbNewHdr) return;
         uint32 newSize = sizeof(MsgHdr) + cbNewHdr + cbNewBody;
+        if (newSize > sizeof(g_RecvPacketPool[0])) return;
 
         uint8* buf = g_RecvPacketPool[g_RecvPacketPoolIdx];
         const MsgHdr* orig = reinterpret_cast<const MsgHdr*>(p->m_pubData);
@@ -113,9 +113,8 @@ namespace {
                                     const uint8* pNewBody, uint32 cbNewBody,
                                     uint32* pNewSize)
     {
-        constexpr uint32 kMaxPayload = sizeof(g_SendPacketPool[0]) - sizeof(MsgHdr);
-        if (cbHdr > kMaxPayload || cbNewBody > kMaxPayload - cbHdr) return nullptr;
         *pNewSize = sizeof(MsgHdr) + cbHdr + cbNewBody;
+        if (*pNewSize > sizeof(g_SendPacketPool[0])) return nullptr;
 
         uint8* buf = g_SendPacketPool[g_SendPacketPoolIdx];
         const MsgHdr* orig = reinterpret_cast<const MsgHdr*>(pubData);
@@ -497,48 +496,14 @@ namespace Hooks_NetPacket_OwnershipTicket {
 // ════════════════════════════════════════════════════════════════
 namespace Hooks_NetPacket_FamilySharing {
 
-    // Sanitizes FamilyGroupsClient.NotifyRunningApps RPC notification:
-    // Retains the valid family_groupid while clearing running_apps entries to 0.
-    // Steam client receives a structurally sound RPC message informing it that
-    // 0 apps are currently running, actively clearing library lock state.
-    void HandleRecv_NotifyRunningApps(const uint8* pBody, uint32 cbBody)
+    void ClearBody(const uint8*, uint32)
     {
-        if (!pBody || cbBody == 0) {
-            g_cbNewBody = 0;
-            g_NeedReplaceBody = true;
+        const auto familyConfig = Config::GetFamilySharingSettings();
+        if (!familyConfig.disableFamilyLock) {
             return;
         }
 
-        CFamilyGroupsClient_NotifyRunningApps_Notification notify;
-        if (notify.ParseFromArray(pBody, static_cast<int>(cbBody))) {
-            const int runningCount = notify.running_apps_size();
-            if (runningCount == 0) {
-                // If there are already 0 running apps, pass through untouched.
-                return;
-            }
-
-            notify.clear_running_apps();
-
-            const auto encSize = notify.ByteSizeLong();
-            if (encSize <= sizeof(g_NewBody) && notify.SerializeToArray(g_NewBody, static_cast<int>(sizeof(g_NewBody)))) {
-                g_cbNewBody = static_cast<uint32>(encSize);
-                g_NeedReplaceBody = true;
-                LOG_NETPACKET_INFO("FamilySharing: Sanitized NotifyRunningApps (family_groupid {}, cleared {} running apps)",
-                                   notify.family_groupid(), runningCount);
-                return;
-            }
-        }
-
-        // Fallback if parsing fails
-        g_cbNewBody = 0;
-        g_NeedReplaceBody = true;
-        LOG_NETPACKET_DEBUG("FamilySharing: Cleared NotifyRunningApps body (fallback)");
-    }
-
-    // Clears incoming lock/stop notifications (eMsg 9405 / 9406) to suppress kick timers
-    void ClearBody(const uint8*, uint32)
-    {
-        LOG_NETPACKET_DEBUG("FamilySharing: Clearing incoming family sharing lock/stop notification...");
+        LOG_NETPACKET_DEBUG("FamilySharing: Clearing incoming family sharing notification message...");
         g_cbNewBody = 0;
         g_NeedReplaceBody = true;
     }
@@ -988,9 +953,8 @@ namespace Hooks_NetPacket_OnlineFix {
     bool HandleSend(const uint8* pBody, uint32 cbBody,
                     const uint8* pHdr, uint32 cbHdr)
     {
-        if (!pBody || cbBody == 0) return false;
         CMsgClientGamesPlayed msg;
-        if (!msg.ParseFromArray(pBody, static_cast<int>(cbBody))) {
+        if (!msg.ParseFromArray(pBody, cbBody)) {
             LOG_ONLINEFIX_WARN("OnlineFix: failed to parse CMsgClientGamesPlayed");
             return false;
         }
@@ -998,6 +962,7 @@ namespace Hooks_NetPacket_OnlineFix {
 
         Hooks_NetPacket_RichPresence::TrackSend(msg, pHdr, cbHdr);
 
+        const auto familyConfig = Config::GetFamilySharingSettings();
         bool patched = false;
         for (int i = 0; i < msg.games_played_size(); ++i) {
             auto* game = msg.mutable_games_played(i);
@@ -1020,11 +985,13 @@ namespace Hooks_NetPacket_OnlineFix {
 
             // Family sharing concurrency / anti-lock protection:
             // Mask lender's owner_id to 1 so Steam server does not lock out the lender.
-            if (game->has_owner_id() && game->owner_id() != 0 && game->owner_id() != 1) {
-                LOG_NETPACKET_INFO("FamilySharing: Masking owner_id {} -> 1 for game_id {}",
-                                   game->owner_id(), game->game_id());
-                game->set_owner_id(1);
-                patched = true;
+            if (familyConfig.disableFamilyLock) {
+                if (game->has_owner_id() && game->owner_id() != 0 && game->owner_id() != 1) {
+                    LOG_NETPACKET_INFO("FamilySharing: Masking owner_id {} -> 1 for game_id {}",
+                                       game->owner_id(), game->game_id());
+                    game->set_owner_id(1);
+                    patched = true;
+                }
             }
         }
 
@@ -1035,7 +1002,7 @@ namespace Hooks_NetPacket_OnlineFix {
             LOG_ONLINEFIX_WARN("OnlineFix: encoded size {} exceeds buffer", g_cbSendNewBody);
             return false;
         }
-        if (!msg.SerializeToArray(g_SendNewBody, static_cast<int>(sizeof(g_SendNewBody)))) {
+        if (!msg.SerializeToArray(g_SendNewBody, kMaxBodySize)) {
             LOG_ONLINEFIX_WARN("OnlineFix: failed to SerializeToArray");
             return false;
         }
@@ -1269,7 +1236,7 @@ namespace {
 
         case k_EMsgServiceMethodCallFromClient: {   // 151
             CMsgProtoBufHeader hdr;
-            if (pHdr && cbHdr > 0 && hdr.ParseFromArray(pHdr, static_cast<int>(cbHdr)) && hdr.has_target_job_name()) {
+            if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_target_job_name()) {
                 g_NeedReplaceSend = SendServiceJob(hdr.target_job_name().c_str(), pBody, cbBody, pHdr, cbHdr);
             }
             return;
@@ -1308,7 +1275,6 @@ namespace {
                         const uint8* pBody, uint32 cbBody,
                         const uint8* pHdr, uint32 cbHdr)
     {
-        if (!targetJobName) return;
         LOG_NETPACKET_DEBUG("Recv target_job_name: {}", targetJobName);
         g_NeedReplaceBody = false;
         g_NeedReplaceHdr  = false;
@@ -1316,7 +1282,7 @@ namespace {
         switch (Fnv1aHash(targetJobName)) {
 
         case HASH_JOB_NotifyRunningApps:
-            Hooks_NetPacket_FamilySharing::HandleRecv_NotifyRunningApps(pBody, cbBody);
+            Hooks_NetPacket_FamilySharing::ClearBody(pBody, cbBody);
             return;
 
         case HASH_JOB_GetUserStats:
@@ -1327,12 +1293,7 @@ namespace {
             Hooks_NetPacket_Manifest::HandleRecv(pBody, cbBody, pHdr, cbHdr);
             return;
 
-        default:
-            if (std::string_view(targetJobName).find("NotifyRunningApps") != std::string_view::npos) {
-                Hooks_NetPacket_FamilySharing::HandleRecv_NotifyRunningApps(pBody, cbBody);
-                return;
-            }
-            break;
+        // ---- add new 147 service methods here ----
         }
     }
 
@@ -1351,11 +1312,9 @@ namespace {
 
         switch (eMsg) {
 
-        case k_EMsgServiceMethod:                      // 146
-        case k_EMsgServiceMethodResponse:              // 147
-        case k_EMsgServiceMethodSendToClient: {        // 152
+        case k_EMsgServiceMethodResponse: {     // 147
             CMsgProtoBufHeader hdr;
-            if (pHdr && cbHdr > 0 && hdr.ParseFromArray(pHdr, static_cast<int>(cbHdr)) && hdr.has_target_job_name())
+            if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_target_job_name())
                 RecvServiceJob(hdr.target_job_name().c_str(), pBody, cbBody, pHdr, cbHdr);
             return;
         }
@@ -1365,7 +1324,6 @@ namespace {
                 pBody, cbBody);
             return;
 
-        case k_EMsgClientSharedLibraryLockStatus:      // 9405
         case k_EMsgClientSharedLibraryStopPlaying:     // 9406
             Hooks_NetPacket_FamilySharing::ClearBody(pBody, cbBody);
             return;
