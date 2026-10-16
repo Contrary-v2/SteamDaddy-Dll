@@ -619,7 +619,18 @@ public:
 
         for (const auto& decl : file_.enums) emitEnum(decl);
 
-        out_ << "namespace IPCMessages {\n\n";
+        out_ << "namespace IPCMessages {\n\n"
+                "// Bring wire enums and conversion functions into namespace IPCMessages for hygienic scoped lookup,\n"
+                "// while preserving root availability for existing consumers (e.g. IPCLoader, Hooks_IPC).\n"
+                "using ::EIPCCommand;\n"
+                "using ::EIPCResult;\n"
+                "using ::EIPCInterface;\n"
+                "using ::EIPCCommandName;\n"
+                "using ::EIPCCommandFromName;\n"
+                "using ::EIPCResultName;\n"
+                "using ::EIPCResultFromName;\n"
+                "using ::EIPCInterfaceName;\n"
+                "using ::EIPCInterfaceFromName;\n\n";
         emitHelpers();
         emitLayouts();
         emitIPCRequest();
@@ -627,7 +638,7 @@ public:
         emitIPCInterfaceCall();
         emitIPCResponse();
         out_ << "template <class T>\n"
-                "std::span<const uint8> asBytes(const T& value) {\n"
+                "[[nodiscard]] constexpr std::span<const uint8> asBytes(const T& value) noexcept {\n"
                 "    static_assert(std::is_trivially_copyable_v<T>);\n"
                 "    return {reinterpret_cast<const uint8*>(&value), sizeof(T)};\n"
                 "}\n\n";
@@ -641,7 +652,7 @@ private:
         for (const auto& member : decl.members)
             out_ << "    " << member.name << " = " << member.value << ",\n";
         out_ << "};\n\n"
-             << "inline const char* " << decl.name << "Name(" << decl.name << " value) {\n"
+             << "[[nodiscard]] constexpr const char* " << decl.name << "Name(" << decl.name << " value) noexcept {\n"
                 "    switch (value) {\n";
         for (const auto& member : decl.members)
             out_ << "    case " << decl.name << "::" << member.name << ": return \""
@@ -649,8 +660,8 @@ private:
         out_ << "    default: return \"Unknown\";\n"
                 "    }\n"
                 "}\n\n"
-             << "inline std::optional<" << decl.name << "> " << decl.name
-             << "FromName(std::string_view name) {\n";
+             << "[[nodiscard]] inline std::optional<" << decl.name << "> " << decl.name
+             << "FromName(std::string_view name) noexcept {\n";
         for (const auto& member : decl.members)
             out_ << "    if (name == \"" << member.name << "\") return "
                  << decl.name << "::" << member.name << ";\n";
@@ -664,31 +675,35 @@ private:
 
     void emitHelpers() {
         out_ << "namespace detail {\n"
-                "inline std::span<uint8> BufferBytes(CUtlBuffer* buffer) {\n"
+                "[[nodiscard]] inline std::span<uint8> BufferBytes(CUtlBuffer* buffer) noexcept {\n"
                 "    if (!buffer || !buffer->Base() || buffer->m_Put < 0) return {};\n"
-                "    return {buffer->Base(), static_cast<size_t>(buffer->m_Put)};\n"
+                "    const size_t put = static_cast<size_t>(buffer->m_Put);\n"
+                "    const size_t cap = static_cast<size_t>(buffer->Capacity());\n"
+                "    return {buffer->Base(), (std::min)(put, cap)};\n"
                 "}\n\n"
                 "template <class T>\n"
-                "T Read(std::span<const uint8> bytes, size_t offset) {\n"
+                "[[nodiscard]] T Read(std::span<const uint8> bytes, size_t offset) noexcept {\n"
+                "    static_assert(std::is_trivially_copyable_v<T>);\n"
                 "    T value{};\n"
                 "    if (offset <= bytes.size() && sizeof(T) <= bytes.size() - offset)\n"
                 "        std::memcpy(&value, bytes.data() + offset, sizeof(T));\n"
                 "    return value;\n"
                 "}\n\n"
                 "template <class T>\n"
-                "void Write(std::span<uint8> bytes, size_t offset, const T& value) {\n"
+                "void Write(std::span<uint8> bytes, size_t offset, const T& value) noexcept {\n"
+                "    static_assert(std::is_trivially_copyable_v<T>);\n"
                 "    if (offset <= bytes.size() && sizeof(T) <= bytes.size() - offset)\n"
                 "        std::memcpy(bytes.data() + offset, &value, sizeof(T));\n"
                 "}\n\n"
                 "template <class T>\n"
-                "size_t ByteCount(T value) {\n"
+                "[[nodiscard]] constexpr size_t ByteCount(T value) noexcept {\n"
                 "    static_assert(std::is_integral_v<T>);\n"
                 "    if constexpr (std::is_signed_v<T>) {\n"
                 "        if (value < 0) return (std::numeric_limits<size_t>::max)();\n"
                 "    }\n"
                 "    return static_cast<size_t>(value);\n"
                 "}\n\n"
-                "inline size_t Sum(std::initializer_list<size_t> values) {\n"
+                "[[nodiscard]] constexpr size_t Sum(std::initializer_list<size_t> values) noexcept {\n"
                 "    size_t result = 0;\n"
                 "    for (size_t value : values) {\n"
                 "        if (value > (std::numeric_limits<size_t>::max)() - result)\n"
@@ -697,24 +712,25 @@ private:
                 "    }\n"
                 "    return result;\n"
                 "}\n\n"
-                "inline bool Fits(std::span<const uint8> bytes, size_t size) {\n"
+                "[[nodiscard]] constexpr bool Fits(std::span<const uint8> bytes, size_t size) noexcept {\n"
                 "    return size != (std::numeric_limits<size_t>::max)() && bytes.size() >= size;\n"
                 "}\n\n"
-                "inline std::span<uint8> Slice(std::span<uint8> bytes, size_t offset, size_t size) {\n"
+                "[[nodiscard]] inline std::span<uint8> Slice(std::span<uint8> bytes, size_t offset, size_t size) noexcept {\n"
                 "    if (offset > bytes.size() || size > bytes.size() - offset) return {};\n"
                 "    return bytes.subspan(offset, size);\n"
                 "}\n\n"
-                "inline std::span<const uint8> Slice(std::span<const uint8> bytes, size_t offset, size_t size) {\n"
+                "[[nodiscard]] inline std::span<const uint8> Slice(std::span<const uint8> bytes, size_t offset, size_t size) noexcept {\n"
                 "    if (offset > bytes.size() || size > bytes.size() - offset) return {};\n"
                 "    return bytes.subspan(offset, size);\n"
                 "}\n\n"
-                "inline bool CopyBytes(std::span<uint8> bytes, size_t offset, size_t capacity,\n"
-                "                      std::span<const uint8> value) {\n"
+                "[[nodiscard]] inline bool CopyBytes(std::span<uint8> bytes, size_t offset, size_t capacity,\n"
+                "                                    std::span<const uint8> value) noexcept {\n"
+                "    if (offset > bytes.size() || capacity > bytes.size() - offset) return false;\n"
+                "    if (value.size() > capacity) return false;\n"
                 "    auto dst = Slice(bytes, offset, capacity);\n"
                 "    if (dst.size() != capacity) return false;\n"
-                "    const size_t count = (std::min)(dst.size(), value.size());\n"
-                "    if (count) std::memcpy(dst.data(), value.data(), count);\n"
-                "    if (count < dst.size()) std::memset(dst.data() + count, 0, dst.size() - count);\n"
+                "    if (!value.empty()) std::memcpy(dst.data(), value.data(), value.size());\n"
+                "    if (value.size() < dst.size()) std::memset(dst.data() + value.size(), 0, dst.size() - value.size());\n"
                 "    return true;\n"
                 "}\n\n"
                 "template <class T>\n"
@@ -728,9 +744,13 @@ private:
                 "        os << kHex[(byte >> 4) & 0x0F] << kHex[byte & 0x0F];\n"
                 "    };\n"
                 "    auto appendHexOffset = [&](size_t offset) {\n"
+                "        bool leading = true;\n"
                 "        for (int shift = static_cast<int>((sizeof(size_t) * 8) - 4); shift >= 0; shift -= 4) {\n"
                 "            const size_t nibble = (offset >> shift) & 0x0F;\n"
-                "            if (nibble || shift <= 12) os << kHex[nibble];\n"
+                "            if (nibble || shift <= 12 || !leading) {\n"
+                "                os << kHex[nibble];\n"
+                "                leading = false;\n"
+                "            }\n"
                 "        }\n"
                 "    };\n"
                 "    os << name << '(' << value.size() << \"B)=hex[\";\n"
@@ -758,21 +778,50 @@ private:
                 out_ << "    " << field.type << " " << field.name << ";\n";
             out_ << "};\n\n";
         }
-        out_ << "#pragma pack(pop)\n"
-                "} // namespace detail\n\n";
+        out_ << "#pragma pack(pop)\n\n";
+        for (const auto& decl : file_.structs) {
+            out_ << "static_assert(std::is_standard_layout_v<" << decl.name << "Layout>,\n"
+                 << "              \"" << decl.name << "Layout must satisfy standard layout\");\n";
+            const auto fixedSize = layoutFixedSize(decl);
+            if (fixedSize.has_value()) {
+                out_ << "static_assert(sizeof(" << decl.name << "Layout) == " << *fixedSize << ",\n"
+                     << "              \"" << decl.name << "Layout ABI size mismatch\");\n";
+            }
+        }
+        out_ << "\n} // namespace detail\n\n";
+    }
+
+    std::optional<size_t> layoutFixedSize(const StructDecl& decl) const {
+        size_t total = 0;
+        for (const auto& field : decl.fields) {
+            if (field.type == "EIPCCommand" || field.type == "EIPCResult" || field.type == "EIPCInterface") {
+                total += 1;
+            } else if (field.type == "uint32" || field.type == "int32" || field.type == "AppId_t") {
+                total += 4;
+            } else if (field.type == "uint64" || field.type == "int64" || field.type == "SteamAPICall_t" || field.type == "CSteamID") {
+                total += 8;
+            } else if (field.type == "bool" || field.type == "uint8" || field.type == "int8" || field.type == "byte") {
+                total += 1;
+            } else if (field.type == "uint16" || field.type == "int16") {
+                total += 2;
+            } else {
+                return std::nullopt;
+            }
+        }
+        return total;
     }
 
     void emitIPCRequest() {
         out_ << "class IPCRequest {\n"
                 "public:\n"
-                "    explicit IPCRequest(CUtlBuffer* buffer) : IPCRequest(detail::BufferBytes(buffer)) {}\n"
-                "    explicit IPCRequest(std::span<uint8> bytes) : bytes_(bytes) {}\n"
-                "    bool ok() const { return bytes_.size() >= sizeof(detail::IPCRequestHeaderLayout); }\n"
-                "    EIPCCommand command() const { return detail::Read<EIPCCommand>(bytes_, offsetof(detail::IPCRequestHeaderLayout, command)); }\n"
-                "    void set_command(EIPCCommand value) { detail::Write(bytes_, offsetof(detail::IPCRequestHeaderLayout, command), value); }\n"
-                "    std::span<uint8> body() { return detail::Slice(bytes_, sizeof(detail::IPCRequestHeaderLayout), bytes_.size() >= sizeof(detail::IPCRequestHeaderLayout) ? bytes_.size() - sizeof(detail::IPCRequestHeaderLayout) : 0); }\n"
-                "    std::span<const uint8> body() const { return detail::Slice(std::span<const uint8>(bytes_), sizeof(detail::IPCRequestHeaderLayout), bytes_.size() >= sizeof(detail::IPCRequestHeaderLayout) ? bytes_.size() - sizeof(detail::IPCRequestHeaderLayout) : 0); }\n"
-                "    std::string DebugString() const { std::ostringstream os; os << \"IPCRequest{\"; detail::AppendField(os, \"command\", command()); os << '}'; return os.str(); }\n"
+                "    explicit IPCRequest(CUtlBuffer* buffer) noexcept : IPCRequest(detail::BufferBytes(buffer)) {}\n"
+                "    explicit IPCRequest(std::span<uint8> bytes) noexcept : bytes_(bytes) {}\n"
+                "    [[nodiscard]] bool ok() const noexcept { return bytes_.size() >= sizeof(detail::IPCRequestHeaderLayout); }\n"
+                "    [[nodiscard]] EIPCCommand command() const noexcept { return detail::Read<EIPCCommand>(bytes_, offsetof(detail::IPCRequestHeaderLayout, command)); }\n"
+                "    void set_command(EIPCCommand value) noexcept { detail::Write(bytes_, offsetof(detail::IPCRequestHeaderLayout, command), value); }\n"
+                "    [[nodiscard]] std::span<uint8> body() noexcept { return detail::Slice(bytes_, sizeof(detail::IPCRequestHeaderLayout), bytes_.size() >= sizeof(detail::IPCRequestHeaderLayout) ? bytes_.size() - sizeof(detail::IPCRequestHeaderLayout) : 0); }\n"
+                "    [[nodiscard]] std::span<const uint8> body() const noexcept { return detail::Slice(std::span<const uint8>(bytes_), sizeof(detail::IPCRequestHeaderLayout), bytes_.size() >= sizeof(detail::IPCRequestHeaderLayout) ? bytes_.size() - sizeof(detail::IPCRequestHeaderLayout) : 0); }\n"
+                "    [[nodiscard]] std::string DebugString() const { std::ostringstream os; os << \"IPCRequest{\"; detail::AppendField(os, \"command\", command()); os << '}'; return os.str(); }\n"
                 "private:\n"
                 "    std::span<uint8> bytes_;\n"
                 "};\n\n";
@@ -794,8 +843,8 @@ private:
     void emitFixedFrameView(const std::string& className, const FrameDecl& frame, bool noneFrame) {
         out_ << "class " << className << " {\n"
                 "public:\n"
-             << "    explicit " << className << "(std::span<uint8> bytes) : bytes_(bytes) {}\n"
-             << "    bool ok() const { return ";
+             << "    explicit " << className << "(std::span<uint8> bytes) noexcept : bytes_(bytes) {}\n"
+             << "    [[nodiscard]] bool ok() const noexcept { return ";
         if (noneFrame)
             out_ << "bytes_.empty()";
         else
@@ -805,10 +854,10 @@ private:
             for (size_t i = 0; i < frame.fields.size(); ++i) {
                 const FrameField& field = frame.fields[i];
                 const std::string offset = frameOffsetExpr(frame, i);
-                out_ << "    " << field.type << " " << field.name
-                     << "() const { return detail::Read<" << field.type << ">(bytes_, " << offset << "); }\n"
+                out_ << "    [[nodiscard]] " << field.type << " " << field.name
+                     << "() const noexcept { return detail::Read<" << field.type << ">(bytes_, " << offset << "); }\n"
                      << "    void set_" << field.name << "(" << field.type
-                     << " value) { detail::Write(bytes_, " << offset << ", value); }\n";
+                     << " value) noexcept { detail::Write(bytes_, " << offset << ", value); }\n";
             }
         }
         emitFrameDebugString(className, noneFrame ? FrameDecl{} : frame);
@@ -838,7 +887,7 @@ private:
     }
 
     void emitFrameDebugString(const std::string& cls, const FrameDecl& frame) {
-        out_ << "    std::string DebugString() const {\n"
+        out_ << "    [[nodiscard]] std::string DebugString() const {\n"
                 "        std::ostringstream os;\n"
              << "        os << \"" << cls << "{\";\n";
         for (size_t i = 0; i < frame.fields.size(); ++i) {
@@ -854,19 +903,19 @@ private:
     void emitIPCInterfaceCall() {
         out_ << "class IPCInterfaceCall {\n"
                 "public:\n"
-                "    explicit IPCInterfaceCall(std::span<uint8> bytes) : bytes_(bytes) {}\n"
-                "    bool ok() const { return bytes_.size() >= sizeof(detail::IPCInterfaceCallHeaderLayout) + sizeof(uint32); }\n"
-                "    EIPCInterface interfaceID() const { return detail::Read<EIPCInterface>(bytes_, offsetof(detail::IPCInterfaceCallHeaderLayout, interfaceID)); }\n"
-                "    void set_interfaceID(EIPCInterface value) { detail::Write(bytes_, offsetof(detail::IPCInterfaceCallHeaderLayout, interfaceID), value); }\n"
-                "    uint32 hSteamUser() const { return detail::Read<uint32>(bytes_, offsetof(detail::IPCInterfaceCallHeaderLayout, hSteamUser)); }\n"
-                "    void set_hSteamUser(uint32 value) { detail::Write(bytes_, offsetof(detail::IPCInterfaceCallHeaderLayout, hSteamUser), value); }\n"
-                "    uint32 funcHash() const { return detail::Read<uint32>(bytes_, offsetof(detail::IPCInterfaceCallHeaderLayout, funcHash)); }\n"
-                "    void set_funcHash(uint32 value) { detail::Write(bytes_, offsetof(detail::IPCInterfaceCallHeaderLayout, funcHash), value); }\n"
-                "    uint32 fencepost() const { return detail::Read<uint32>(bytes_, bytes_.size() >= sizeof(uint32) ? bytes_.size() - sizeof(uint32) : 0); }\n"
-                "    void set_fencepost(uint32 value) { if (bytes_.size() >= sizeof(uint32)) detail::Write(bytes_, bytes_.size() - sizeof(uint32), value); }\n"
-                "    std::span<uint8> body() { const size_t prefix = sizeof(detail::IPCInterfaceCallHeaderLayout); const size_t suffix = sizeof(uint32); return detail::Slice(bytes_, prefix, bytes_.size() >= prefix + suffix ? bytes_.size() - prefix - suffix : 0); }\n"
-                "    std::span<const uint8> body() const { const size_t prefix = sizeof(detail::IPCInterfaceCallHeaderLayout); const size_t suffix = sizeof(uint32); return detail::Slice(std::span<const uint8>(bytes_), prefix, bytes_.size() >= prefix + suffix ? bytes_.size() - prefix - suffix : 0); }\n"
-                "    std::string DebugString() const { std::ostringstream os; os << \"IPCInterfaceCall{\"; detail::AppendField(os, \"interfaceID\", interfaceID()); os << ' '; detail::AppendField(os, \"hSteamUser\", hSteamUser()); os << ' '; detail::AppendField(os, \"funcHash\", funcHash()); os << ' '; detail::AppendField(os, \"fencepost\", fencepost()); os << '}'; return os.str(); }\n"
+                "    explicit IPCInterfaceCall(std::span<uint8> bytes) noexcept : bytes_(bytes) {}\n"
+                "    [[nodiscard]] bool ok() const noexcept { return bytes_.size() >= sizeof(detail::IPCInterfaceCallHeaderLayout) + sizeof(uint32); }\n"
+                "    [[nodiscard]] EIPCInterface interfaceID() const noexcept { return detail::Read<EIPCInterface>(bytes_, offsetof(detail::IPCInterfaceCallHeaderLayout, interfaceID)); }\n"
+                "    void set_interfaceID(EIPCInterface value) noexcept { detail::Write(bytes_, offsetof(detail::IPCInterfaceCallHeaderLayout, interfaceID), value); }\n"
+                "    [[nodiscard]] uint32 hSteamUser() const noexcept { return detail::Read<uint32>(bytes_, offsetof(detail::IPCInterfaceCallHeaderLayout, hSteamUser)); }\n"
+                "    void set_hSteamUser(uint32 value) noexcept { detail::Write(bytes_, offsetof(detail::IPCInterfaceCallHeaderLayout, hSteamUser), value); }\n"
+                "    [[nodiscard]] uint32 funcHash() const noexcept { return detail::Read<uint32>(bytes_, offsetof(detail::IPCInterfaceCallHeaderLayout, funcHash)); }\n"
+                "    void set_funcHash(uint32 value) noexcept { detail::Write(bytes_, offsetof(detail::IPCInterfaceCallHeaderLayout, funcHash), value); }\n"
+                "    [[nodiscard]] uint32 fencepost() const noexcept { return detail::Read<uint32>(bytes_, bytes_.size() >= sizeof(uint32) ? bytes_.size() - sizeof(uint32) : 0); }\n"
+                "    void set_fencepost(uint32 value) noexcept { if (bytes_.size() >= sizeof(uint32)) detail::Write(bytes_, bytes_.size() - sizeof(uint32), value); }\n"
+                "    [[nodiscard]] std::span<uint8> body() noexcept { const size_t prefix = sizeof(detail::IPCInterfaceCallHeaderLayout); const size_t suffix = sizeof(uint32); return detail::Slice(bytes_, prefix, bytes_.size() >= prefix + suffix ? bytes_.size() - prefix - suffix : 0); }\n"
+                "    [[nodiscard]] std::span<const uint8> body() const noexcept { const size_t prefix = sizeof(detail::IPCInterfaceCallHeaderLayout); const size_t suffix = sizeof(uint32); return detail::Slice(std::span<const uint8>(bytes_), prefix, bytes_.size() >= prefix + suffix ? bytes_.size() - prefix - suffix : 0); }\n"
+                "    [[nodiscard]] std::string DebugString() const { std::ostringstream os; os << \"IPCInterfaceCall{\"; detail::AppendField(os, \"interfaceID\", interfaceID()); os << ' '; detail::AppendField(os, \"hSteamUser\", hSteamUser()); os << ' '; detail::AppendField(os, \"funcHash\", funcHash()); os << ' '; detail::AppendField(os, \"fencepost\", fencepost()); os << '}'; return os.str(); }\n"
                 "private:\n"
                 "    std::span<uint8> bytes_;\n"
                 "};\n\n";
@@ -875,14 +924,14 @@ private:
     void emitIPCResponse() {
         out_ << "class IPCResponse {\n"
                 "public:\n"
-                "    explicit IPCResponse(CUtlBuffer* buffer) : IPCResponse(detail::BufferBytes(buffer)) {}\n"
-                "    explicit IPCResponse(std::span<uint8> bytes) : bytes_(bytes) {}\n"
-                "    bool ok() const { return bytes_.size() >= sizeof(detail::IPCResponseHeaderLayout); }\n"
-                "    EIPCResult result() const { return detail::Read<EIPCResult>(bytes_, offsetof(detail::IPCResponseHeaderLayout, result)); }\n"
-                "    void set_result(EIPCResult value) { detail::Write(bytes_, offsetof(detail::IPCResponseHeaderLayout, result), value); }\n"
-                "    std::span<uint8> body() { return detail::Slice(bytes_, sizeof(detail::IPCResponseHeaderLayout), bytes_.size() >= sizeof(detail::IPCResponseHeaderLayout) ? bytes_.size() - sizeof(detail::IPCResponseHeaderLayout) : 0); }\n"
-                "    std::span<const uint8> body() const { return detail::Slice(std::span<const uint8>(bytes_), sizeof(detail::IPCResponseHeaderLayout), bytes_.size() >= sizeof(detail::IPCResponseHeaderLayout) ? bytes_.size() - sizeof(detail::IPCResponseHeaderLayout) : 0); }\n"
-                "    std::string DebugString() const { std::ostringstream os; os << \"IPCResponse{\"; detail::AppendField(os, \"result\", result()); os << '}'; return os.str(); }\n"
+                "    explicit IPCResponse(CUtlBuffer* buffer) noexcept : IPCResponse(detail::BufferBytes(buffer)) {}\n"
+                "    explicit IPCResponse(std::span<uint8> bytes) noexcept : bytes_(bytes) {}\n"
+                "    [[nodiscard]] bool ok() const noexcept { return bytes_.size() >= sizeof(detail::IPCResponseHeaderLayout); }\n"
+                "    [[nodiscard]] EIPCResult result() const noexcept { return detail::Read<EIPCResult>(bytes_, offsetof(detail::IPCResponseHeaderLayout, result)); }\n"
+                "    void set_result(EIPCResult value) noexcept { detail::Write(bytes_, offsetof(detail::IPCResponseHeaderLayout, result), value); }\n"
+                "    [[nodiscard]] std::span<uint8> body() noexcept { return detail::Slice(bytes_, sizeof(detail::IPCResponseHeaderLayout), bytes_.size() >= sizeof(detail::IPCResponseHeaderLayout) ? bytes_.size() - sizeof(detail::IPCResponseHeaderLayout) : 0); }\n"
+                "    [[nodiscard]] std::span<const uint8> body() const noexcept { return detail::Slice(std::span<const uint8>(bytes_), sizeof(detail::IPCResponseHeaderLayout), bytes_.size() >= sizeof(detail::IPCResponseHeaderLayout) ? bytes_.size() - sizeof(detail::IPCResponseHeaderLayout) : 0); }\n"
+                "    [[nodiscard]] std::string DebugString() const { std::ostringstream os; os << \"IPCResponse{\"; detail::AppendField(os, \"result\", result()); os << '}'; return os.str(); }\n"
                 "private:\n"
                 "    std::span<uint8> bytes_;\n"
                 "};\n\n";
@@ -891,28 +940,28 @@ private:
     void emitInterface(const Interface& iface) {
         out_ << "namespace " << iface.name << " {\n"
              << "inline constexpr EIPCInterface kInterface = EIPCInterface::" << iface.name << ";\n\n";
-        for (const auto& method : iface.methods) emitReq(iface, method);
+        for (const auto& method : iface.methods) emitReq(method);
         for (const auto& method : iface.methods) emitResp(method);
         out_ << "} // namespace " << iface.name << "\n\n";
     }
 
-    void emitReq(const Interface& iface, const Method& method) {
+    void emitReq(const Method& method) {
         const std::vector<Field> fields = fieldsFor(method, Dir::In, false);
         const std::string cls = method.name + "Req";
         out_ << "class " << cls << " {\n"
                 "public:\n"
-             << "    explicit " << cls << "(CUtlBuffer* buffer) : " << cls
+             << "    explicit " << cls << "(CUtlBuffer* buffer) noexcept : " << cls
              << "(detail::BufferBytes(buffer)) {}\n"
-             << "    explicit " << cls << "(std::span<uint8> bytes) : request_(bytes), call_(request_.body()) {}\n"
-                "    bool ok() const { return request_.ok() && request_.command() == EIPCCommand::InterfaceCall && call_.ok() && call_.interfaceID() == kInterface && detail::Fits(call_.body(), bodySize()); }\n"
-                "    uint32 fencepost() const { return call_.fencepost(); }\n"
-                "    void set_fencepost(uint32 value) { call_.set_fencepost(value); }\n";
+             << "    explicit " << cls << "(std::span<uint8> bytes) noexcept : request_(bytes), call_(request_.body()) {}\n"
+                "    [[nodiscard]] bool ok() const noexcept { return request_.ok() && request_.command() == EIPCCommand::InterfaceCall && call_.ok() && call_.interfaceID() == kInterface && detail::Fits(call_.body(), bodySize()); }\n"
+                "    [[nodiscard]] uint32 fencepost() const noexcept { return call_.fencepost(); }\n"
+                "    void set_fencepost(uint32 value) noexcept { call_.set_fencepost(value); }\n";
         emitFieldAccessors(fields, fields, {});
         emitDebugString(cls, fields);
         out_ << "private:\n"
-             << "    size_t bodySize() const { return " << sumExpr(fields, fields, {}, false) << "; }\n"
-                "    std::span<uint8> body() { return call_.body(); }\n"
-                "    std::span<const uint8> body() const { return call_.body(); }\n"
+             << "    [[nodiscard]] size_t bodySize() const noexcept { return " << sumExpr(fields, fields, {}, false) << "; }\n"
+                "    [[nodiscard]] std::span<uint8> body() noexcept { return call_.body(); }\n"
+                "    [[nodiscard]] std::span<const uint8> body() const noexcept { return call_.body(); }\n"
                 "    IPCRequest request_;\n"
                 "    IPCInterfaceCall call_;\n"
                 "};\n\n";
@@ -920,30 +969,30 @@ private:
 
     void emitResp(const Method& method) {
         std::vector<Field> fields = fieldsFor(method, Dir::Out, true);
-        const std::vector<std::string> external = externalRefs(method, fields);
+        const std::vector<std::string> external = externalRefs(fields);
         const std::string cls = method.name + "Resp";
         out_ << "class " << cls << " {\n"
                 "public:\n"
              << "    explicit " << cls << "(CUtlBuffer* buffer";
         emitCtorParams(external);
-        out_ << ") : " << cls << "(detail::BufferBytes(buffer)";
+        out_ << ") noexcept : " << cls << "(detail::BufferBytes(buffer)";
         emitCtorArgs(external);
         out_ << ") {}\n"
              << "    explicit " << cls << "(std::span<uint8> bytes";
         emitCtorParams(external);
-        out_ << ") : response_(bytes)";
+        out_ << ") noexcept : response_(bytes)";
         for (const auto& name : external) out_ << ", " << name << "_(" << name << ")";
         out_ << " {}\n"
-                "    bool ok() const { return response_.ok() && detail::Fits(response_.body(), minimumBodySize()); }\n"
-                "    EIPCResult result() const { return response_.result(); }\n"
-                "    void set_result(EIPCResult value) { response_.set_result(value); }\n";
+                "    [[nodiscard]] bool ok() const noexcept { return response_.ok() && detail::Fits(response_.body(), minimumBodySize()); }\n"
+                "    [[nodiscard]] EIPCResult result() const noexcept { return response_.result(); }\n"
+                "    void set_result(EIPCResult value) noexcept { response_.set_result(value); }\n";
         emitFieldAccessors(fields, fields, external);
         emitDebugString(cls, fields);
         out_ << "private:\n"
-             << "    size_t minimumBodySize() const { return "
+             << "    [[nodiscard]] size_t minimumBodySize() const noexcept { return "
              << sumExpr(fields, fields, external, true) << "; }\n"
-                "    std::span<uint8> body() { return response_.body(); }\n"
-                "    std::span<const uint8> body() const { return response_.body(); }\n"
+                "    [[nodiscard]] std::span<uint8> body() noexcept { return response_.body(); }\n"
+                "    [[nodiscard]] std::span<const uint8> body() const noexcept { return response_.body(); }\n"
                 "    IPCResponse response_;\n";
         for (const auto& name : external) out_ << "    size_t " << name << "_;\n";
         out_ << "};\n\n";
@@ -957,24 +1006,35 @@ private:
             const std::string offset = offsetExpr(fields, i, sideFields, external);
             if (field.type == "bytes") {
                 const std::string length = lengthExpr(field, sideFields, external);
-                out_ << "    std::span<uint8> " << field.name << "() { return detail::Slice(body(), "
+                out_ << "    [[nodiscard]] std::span<uint8> " << field.name << "() noexcept { return detail::Slice(body(), "
                      << offset << ", " << length << "); }\n"
-                     << "    std::span<const uint8> " << field.name
-                     << "() const { return detail::Slice(body(), " << offset << ", " << length << "); }\n"
-                     << "    bool set_" << field.name
-                     << "(std::span<const uint8> value) { return detail::CopyBytes(body(), "
-                     << offset << ", " << length << ", value); }\n";
+                     << "    [[nodiscard]] std::span<const uint8> " << field.name
+                     << "() const noexcept { return detail::Slice(body(), " << offset << ", " << length << "); }\n";
+                if (const Field* lenField = findField(sideFields, field.lenRef)) {
+                    const std::string& lenType = lenField->type;
+                    out_ << "    [[nodiscard]] bool set_" << field.name << "(std::span<const uint8> value) noexcept {\n"
+                         << "        if (value.size() > static_cast<size_t>((std::numeric_limits<" << lenType << ">::max)())) return false;\n"
+                         << "        const size_t offset = " << offset << ";\n"
+                         << "        if (offset > body().size() || value.size() > body().size() - offset) return false;\n"
+                         << "        set_" << field.lenRef << "(static_cast<" << lenType << ">(value.size()));\n"
+                         << "        return detail::CopyBytes(body(), offset, value.size(), value);\n"
+                         << "    }\n";
+                } else {
+                    out_ << "    [[nodiscard]] bool set_" << field.name
+                         << "(std::span<const uint8> value) noexcept { return detail::CopyBytes(body(), "
+                         << offset << ", " << length << ", value); }\n";
+                }
             } else {
-                out_ << "    " << field.type << " " << field.name
-                     << "() const { return detail::Read<" << field.type << ">(body(), " << offset << "); }\n"
+                out_ << "    [[nodiscard]] " << field.type << " " << field.name
+                     << "() const noexcept { return detail::Read<" << field.type << ">(body(), " << offset << "); }\n"
                      << "    void set_" << field.name << "(" << field.type
-                     << " value) { detail::Write(body(), " << offset << ", value); }\n";
+                     << " value) noexcept { detail::Write(body(), " << offset << ", value); }\n";
             }
         }
     }
 
     void emitDebugString(const std::string& cls, const std::vector<Field>& fields) {
-        out_ << "    std::string DebugString() const {\n"
+        out_ << "    [[nodiscard]] std::string DebugString() const {\n"
                 "        std::ostringstream os;\n"
              << "        os << \"" << cls << "{\";\n";
         for (size_t i = 0; i < fields.size(); ++i) {
@@ -1004,8 +1064,7 @@ private:
         return fields;
     }
 
-    static std::vector<std::string> externalRefs(const Method& method,
-                                                 const std::vector<Field>& fields) {
+    static std::vector<std::string> externalRefs(const std::vector<Field>& fields) {
         std::vector<std::string> result;
         for (const auto& field : fields) {
             if (field.lenRef.empty() || containsField(fields, field.lenRef)) continue;
@@ -1015,9 +1074,14 @@ private:
         return result;
     }
 
+    static const Field* findField(const std::vector<Field>& fields, std::string_view name) {
+        auto it = std::find_if(fields.begin(), fields.end(),
+                               [name](const Field& field) { return field.name == name; });
+        return it != fields.end() ? &(*it) : nullptr;
+    }
+
     static bool containsField(const std::vector<Field>& fields, std::string_view name) {
-        return std::any_of(fields.begin(), fields.end(),
-                           [name](const Field& field) { return field.name == name; });
+        return findField(fields, name) != nullptr;
     }
 
     static bool containsName(const std::vector<std::string>& names, std::string_view name) {
@@ -1112,6 +1176,11 @@ std::string stem(const std::string& path) {
     return path.substr(start, end - start);
 }
 
+std::string filename(const std::string& path) {
+    const size_t slash = path.find_last_of("/\\");
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
 bool generate(const std::string& inputPath, const std::string& cppOut) {
     std::ifstream input(inputPath, std::ios::binary);
     if (!input) {
@@ -1131,14 +1200,27 @@ bool generate(const std::string& inputPath, const std::string& cppOut) {
 
     std::ostringstream generated;
     Emitter emitter(generated, file);
-    emitter.emit(inputPath, header);
+    emitter.emit(filename(inputPath), header);
+
+    const std::string generatedStr = generated.str();
+
+    // Write-if-changed: avoid bumping mtime if content is identical
+    std::ifstream existing(outputPath, std::ios::binary);
+    if (existing) {
+        std::ostringstream existingBuf;
+        existingBuf << existing.rdbuf();
+        if (existingBuf.str() == generatedStr) {
+            std::fprintf(stderr, "ipc_codegen: %s is up-to-date (unchanged)\n", outputPath.c_str());
+            return true;
+        }
+    }
 
     std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
     if (!output) {
         std::fprintf(stderr, "ipc_codegen: cannot write %s\n", outputPath.c_str());
         return false;
     }
-    output << generated.str();
+    output << generatedStr;
     if (!output) {
         std::fprintf(stderr, "ipc_codegen: failed to write %s\n", outputPath.c_str());
         return false;

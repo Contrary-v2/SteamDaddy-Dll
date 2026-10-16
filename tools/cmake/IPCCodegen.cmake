@@ -4,23 +4,23 @@
 # pull it in with add_subdirectory() and then invoke it through this helper, the
 # same way protobuf_generate invokes the protoc target.
 
-# opensteamtool_add_ipc_codegen(<out_var> IDL <file.steamd> CPP_OUT <dir>)
+# steamdaddy_add_ipc_codegen(<out_var> IDL <file.steamd> CPP_OUT <dir>)
 #
 # Generates <CPP_OUT>/<idl-stem>.gen.h from the IDL and returns the generated
 # header path in <out_var>, suitable for listing as a target source.
-function(opensteamtool_add_ipc_codegen out_var)
+function(steamdaddy_add_ipc_codegen out_var)
     set(one_value_args IDL CPP_OUT)
     cmake_parse_arguments(IPC "" "${one_value_args}" "" ${ARGN})
 
     foreach(_required IDL CPP_OUT)
         if(NOT IPC_${_required})
-            message(FATAL_ERROR "opensteamtool_add_ipc_codegen requires ${_required}")
+            message(FATAL_ERROR "steamdaddy_add_ipc_codegen requires ${_required}")
         endif()
     endforeach()
 
     if(NOT TARGET ipc_codegen)
         message(FATAL_ERROR
-            "opensteamtool_add_ipc_codegen: target 'ipc_codegen' is not defined; "
+            "steamdaddy_add_ipc_codegen: target 'ipc_codegen' is not defined; "
             "add_subdirectory() the tools directory before calling this function")
     endif()
 
