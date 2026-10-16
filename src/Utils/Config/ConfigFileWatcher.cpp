@@ -1,23 +1,27 @@
-#include "Hook/Hooks_Package.h"
 #include "Utils/Config/Config.h"
 #include "Utils/Config/LuaConfig.h"
 #include "Utils/Config/LuaFileWatcher.h"
 #include "Utils/Config/ConfigFileWatcher.h"
 #include "Utils/Logging/Log.h"
 #include "OSTPlatform/include/DirectoryWatch.h"
+#include "OSTPlatform/include/Encoding.h"
+#include "OSTPlatform/include/Thread.h"
+#include "dllmain.h"
 
 #include <atomic>
 #include <cctype>
 #include <filesystem>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace ConfigFileWatcher {
 namespace {
 
+std::atomic<LicenseChangedCallback> g_licenseChangedCb{nullptr};
 std::atomic<bool> g_running{false};
-std::thread g_watcherThread;
+OSTPlatform::Thread::SafeThread g_watcherThread;
 std::string g_configPath;
 std::string g_defaultLuaDir;
 
@@ -38,7 +42,12 @@ bool ContainsConfigChange(
     const std::vector<OSTPlatform::DirectoryWatch::Change>& changes,
     std::string_view targetFileName) {
     for (const auto& change : changes) {
-        if (SameFileName(change.relativePath, targetFileName)) {
+        std::string_view changeName = change.relativePath;
+        const size_t slash = changeName.find_last_of("\\/");
+        if (slash != std::string_view::npos) {
+            changeName = changeName.substr(slash + 1);
+        }
+        if (SameFileName(changeName, targetFileName)) {
             return true;
         }
     }
@@ -46,8 +55,29 @@ bool ContainsConfigChange(
 }
 
 std::vector<std::string> BuildLuaWatchDirs() {
-    std::vector<std::string> watchDirs = Config::GetLuaPaths();
-    watchDirs.push_back(g_defaultLuaDir);
+    std::vector<std::string> watchDirs;
+    std::unordered_set<std::string> seen;
+    auto addDir = [&](const std::string& d) {
+        if (d.empty()) return;
+        std::string norm = OSTPlatform::Encoding::PathToUtf8(
+            OSTPlatform::Encoding::PathFromUtf8(d).lexically_normal());
+        if (seen.insert(norm).second) {
+            watchDirs.push_back(std::move(norm));
+        }
+    };
+
+    for (const auto& p : Config::GetLuaPaths()) {
+        addDir(p);
+    }
+    addDir(g_defaultLuaDir);
+    if (IsPortableMode()) {
+        std::string steamLua = OSTPlatform::Encoding::PathToUtf8(
+            OSTPlatform::Encoding::PathFromUtf8(SteamInstallPath) / "config" / "stplug-in");
+        std::error_code ec;
+        if (std::filesystem::exists(OSTPlatform::Encoding::PathFromUtf8(steamLua), ec) && !ec) {
+            addDir(steamLua);
+        }
+    }
     return watchDirs;
 }
 
@@ -58,7 +88,9 @@ void RestartLuaWatcher() {
     LuaConfig::ReloadDirectories(watchDirs);
     LuaFileWatcher::Start(watchDirs);
 
-    Hooks_Package::NotifyLicenseChanged();
+    if (auto cb = g_licenseChangedCb.load(std::memory_order_relaxed)) {
+        cb();
+    }
     LOG_INFO("Lua directories refreshed after config reload: {}", static_cast<uint32_t>(watchDirs.size()));
 }
 
@@ -79,13 +111,22 @@ void ReloadConfig() {
 }
 
 void WatcherThread() {
-    const std::filesystem::path configPath(g_configPath);
-    const std::filesystem::path dirPath = configPath.parent_path();
-    const std::string targetFileName = configPath.filename().string();
+    struct RunningGuard {
+        std::atomic<bool>& flag;
+        ~RunningGuard() { flag.store(false, std::memory_order_release); }
+    } runningGuard{g_running};
+
+    const std::filesystem::path configPath = OSTPlatform::Encoding::PathFromUtf8(g_configPath);
+    std::filesystem::path dirPath = configPath.parent_path();
+    if (dirPath.empty()) {
+        dirPath = std::filesystem::current_path();
+    }
+    const std::string dirPathUtf8 = OSTPlatform::Encoding::PathToUtf8(dirPath);
+    const std::string targetFileName = OSTPlatform::Encoding::PathToUtf8(configPath.filename());
 
     OSTPlatform::DirectoryWatch::Watch watch;
-    if (!watch.Open(dirPath.string(), 4096)) {
-        LOG_WARN("Failed to open config watch directory: {}", dirPath.string());
+    if (!watch.Open(dirPathUtf8, 4096)) {
+        LOG_WARN("Failed to open config watch directory: {}", dirPathUtf8);
         return;
     }
     if (!watch.IssueRead()) {
@@ -103,25 +144,29 @@ void WatcherThread() {
         return changed;
     };
 
-    while (g_running) {
-        auto waitResult = OSTPlatform::DirectoryWatch::WaitAny(watches, 1000);
-
-        if (!g_running) break;
-        if (waitResult.status == OSTPlatform::DirectoryWatch::WaitStatus::Timeout) continue;
-        if (waitResult.status != OSTPlatform::DirectoryWatch::WaitStatus::Signaled) continue;
-
-        bool changed = drainEvent();
+    try {
         while (g_running) {
-            auto debounceResult = OSTPlatform::DirectoryWatch::WaitAny(watches, kDebounceMs);
-            if (!g_running) break;
-            if (debounceResult.status == OSTPlatform::DirectoryWatch::WaitStatus::Timeout) break;
-            if (debounceResult.status != OSTPlatform::DirectoryWatch::WaitStatus::Signaled) break;
-            changed = drainEvent() || changed;
-        }
+            auto waitResult = OSTPlatform::DirectoryWatch::WaitAny(watches, 1000);
 
-        if (changed) {
-            ReloadConfig();
+            if (!g_running) break;
+            if (waitResult.status == OSTPlatform::DirectoryWatch::WaitStatus::Timeout) continue;
+            if (waitResult.status != OSTPlatform::DirectoryWatch::WaitStatus::Signaled) continue;
+
+            bool changed = drainEvent();
+            while (g_running) {
+                auto debounceResult = OSTPlatform::DirectoryWatch::WaitAny(watches, kDebounceMs);
+                if (!g_running) break;
+                if (debounceResult.status == OSTPlatform::DirectoryWatch::WaitStatus::Timeout) break;
+                if (debounceResult.status != OSTPlatform::DirectoryWatch::WaitStatus::Signaled) break;
+                changed = drainEvent() || changed;
+            }
+
+            if (changed) {
+                ReloadConfig();
+            }
         }
+    } catch (const std::exception& ex) {
+        LOG_WARN("ConfigFileWatcher thread exception: {}", ex.what());
     }
 
     watch.Cancel();
@@ -129,6 +174,10 @@ void WatcherThread() {
 }
 
 } // namespace
+
+void SetLicenseChangedCallback(LicenseChangedCallback cb) {
+    g_licenseChangedCb.store(cb, std::memory_order_release);
+}
 
 void Start(const std::string& configPath, const std::string& defaultLuaDir) {
     if (g_running.exchange(true)) {
@@ -142,10 +191,16 @@ void Start(const std::string& configPath, const std::string& defaultLuaDir) {
 }
 
 void Stop() {
-    if (!g_running) return;
-    g_running = false;
+    g_running.store(false, std::memory_order_release);
     if (g_watcherThread.joinable()) {
         g_watcherThread.join();
+    }
+}
+
+void Detach() {
+    g_running.store(false, std::memory_order_release);
+    if (g_watcherThread.joinable()) {
+        g_watcherThread.detach();
     }
 }
 
