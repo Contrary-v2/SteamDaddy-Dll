@@ -1,0 +1,159 @@
+# steamdaddy.toml — SteamDaddy Configuration File
+# Place at: <Steam>/steamdaddy.toml
+# This file is loaded at startup and hot-reloaded after changes.
+
+[log]
+# Log verbosity for all log files (Debug build only).
+# Valid: trace, debug, info, warn, error
+level = "debug"
+# Directory where log files are written (optional, Debug build only).
+# Defaults to "<Steam>/steamdaddy" or alongside steamdaddy.toml.
+# dir = "steamdaddy"
+
+[manifest]
+# Which upstream API to query for depot manifest request codes.
+#   "20770407"      → https://20770407.xyz/manifest/{depotId}/{gid} (default)
+#   "SDM"           → https://steamapi.993499094.xyz/manifest/{depotId}/{gid}
+#   "manifestdex"   → https://manifest.manifestdex.com/{gid} (requires User-Agent: ManifestDeX/1.0, sent automatically)
+#   "wudrm"         → http://gmrc.wudrm.com/manifest/{gid} (recommended for China users)
+#   "steamrun"      → https://manifest.steam.run/api/manifest/{gid}
+#   "opensteamtool" → https://manifest.opensteamtool.com/{gid}
+# If <Steam>/config/stplug-in/manifest.lua defines fetch_manifest_code(gid) or
+# fetch_manifest_code_ex(app_id, depot_id, gid), those Lua functions take
+# priority over the url setting below.
+#
+# url selects the first upstream to try. When failover is enabled and
+# that upstream fails, the remaining upstreams are tried in table order;
+# the configured url stays the first choice for subsequent fetches.
+# An upstream that just failed is skipped on cooldown for 60 seconds.
+url = "20770407"
+
+# Failover across manifest upstreams. true (default) tries the next
+# upstream when the preferred one fails; false only queries url above.
+# Hot-reloaded, no restart required.
+failover = true
+
+# HTTP timeouts for manifest requests (milliseconds).
+# timeout_resolve_ms  — DNS resolution         (default: 5000)
+# timeout_connect_ms  — TCP handshake          (default: 5000)
+# timeout_send_ms     — request transmission   (default: 10000)
+# timeout_recv_ms     — response body download (default: 10000)
+timeout_resolve_ms = 5000
+timeout_connect_ms = 5000
+timeout_send_ms    = 10000
+timeout_recv_ms    = 10000
+
+# Whether to enforce depot manifest locking (setManifestid) on games/DLCs truly owned by the current account.
+# false (default) -> Bypasses manifest locking for owned games/DLCs, allowing Steam to receive official updates normally.
+#                    Unowned DLCs and secondary accounts without licenses remain strictly manifest-locked.
+# true            -> Enforces manifest locking on all depots in Lua, even if the account owns the license.
+lock_owned_games = false
+
+# Whether to automatically synchronize .lua and manifest mirrors when an owned game finishes updating in Steam (without having to launch the game).
+# true (default)  -> Automatically synchronize in the background as soon as Steam completes the update download.
+# false           -> Synchronize only when the game is launched ("Play" button).
+auto_sync_on_update = true
+
+# --- manifest.lua reference ---
+# The C++ side provides http_get(url [, headers]) and
+# http_post(url, body [, headers]) to Lua scripts. Both return
+# (body_string, status_code) on success, or (nil, error_msg) on failure.
+#
+# -- Example: try wudrm (plain-text uint64), fall back to steamrun (JSON).
+# -- Return a digit *string* to avoid double-precision loss > 2^53.
+# function fetch_manifest_code(gid)
+#     -- wudrm responds with e.g. "10570517747114638659"
+#     local body, st = http_get("http://gmrc.wudrm.com/manifest/" .. gid)
+#     if st == 200 and body then return body end
+#     -- steamrun responds with {"content":"1666836470726104466"}
+#     body, st = http_get("https://manifest.steam.run/api/manifest/" .. gid)
+#     if st == 200 and body then
+#         local code = body:match('"content":"(%d+)"')
+#         if code then return code end
+#     end
+#     return nil
+# end
+#
+# -- Extended variant with app_id and depot_id:
+# function fetch_manifest_code_ex(app_id, depot_id, gid)
+#     local body, st = http_get("https://your-api.com/manifest-code/" .. app_id .. "/" .. gid)
+#     if st == 200 and body and body:match("^%d+$") then
+#         return body
+#     end
+#     return nil
+# end
+
+[stats]
+# Automatically query https://stats.opensteamtool.com/{appid} for a recommended
+# SteamID when no Lua setStat(appid, "steamid") override exists.
+# Priority: setStat > stats API when enabled and valid > hardcoded preset SteamID.
+enable_api = true
+
+# Additional Lua config directories (optional).
+# Files are loaded after the default <Steam>/config/stplug-in folder.
+# The default folder is always loaded last so user files take priority.
+# Example — load a custom directory on another drive:
+#   [lua]
+#   paths = ["D:/my-steam-config/stplug-in"]
+[lua]
+# paths = []
+
+[injects]
+# Global DLL injection settings.
+# exclude_appids: AppIDs to strictly exclude from library injection into game processes.
+# Explicitly specifying appids here overrides the built-in default list without merging.
+# If omitted entirely, SteamDaddy defaults to protecting ~20 known competitive multiplayer games (VAC/EAC/BattlEye).
+exclude_appids = [
+    # --- Valve Anti-Cheat (VAC) core competitive series ---
+    730,      # Counter-Strike 2 (CS2 / CS:GO)
+    570,      # Dota 2
+    440,      # Team Fortress 2
+    550,      # Left 4 Dead 2
+    1422450,  # Deadlock
+    240,      # Counter-Strike: Source
+    300,      # Day of Defeat: Source
+
+    # --- Easy Anti-Cheat (EAC) popular multiplayer series ---
+    1172470,  # Apex Legends
+    252490,   # Rust
+    381210,   # Dead by Daylight
+    2073850,  # THE FINALS
+    230410,   # Warframe
+    236390,   # War Thunder
+    976730,   # Halo: The Master Chief Collection
+    1240440,  # Halo Infinite
+
+    # --- BattlEye / Tencent ACE / other kernel-level anti-cheat series ---
+    578080,   # PUBG: BATTLEGROUNDS
+    359550,   # Tom Clancy's Rainbow Six Siege
+    1085660,  # Destiny 2
+    1938090,  # Call of Duty® (Ricochet)
+    2195250,  # EA SPORTS FC™ 24
+    2669320,  # EA SPORTS FC™ 25
+    553850,   # HELLDIVERS™ 2 (nProtect GameGuard)
+]
+
+# Optional library injection into game processes. Each [[inject]] entry is evaluated
+# when launching a game process.
+#
+# [[inject]]
+# path = "OnlineFix.dll"              # bare name resolves next to steam.exe; absolute path used as-is
+# all_games = false                   # false = targets Lua-unlocked games only. true = injects all Steam games (guarded by exclude_appids).
+# when_cmdline = "-onlinefix"         # Optional: require this substring in launch command (default: any)
+# when_appids = [1361510]             # Whitelist: target specific AppIDs (takes priority over exclude_appids)
+
+[cloud]
+# Optional Steam Cloud save redirection for unlocked ("lua") games, powered by
+# CloudRedirect (https://github.com/Selectively11/CloudRedirect).
+# When enabled, SteamDaddy loads cloud_redirect.dll inside Steam, registers
+# every addappid() game as a redirected app, and routes their Steam Cloud RPCs
+# through CloudRedirect's cloud-save engine (fully compatible with Diversion memory isolation).
+enabled = false
+# Path to cloud_redirect.dll. Absolute, or relative to steamdaddy.toml, DLL dir, or Steam root.
+# library = "cloud_redirect.dll"
+
+[remote]
+# Optional metadata mirror order: "gh-proxy-first" (default) or "github-first"
+order = "gh-proxy-first"
+# url_template: Optional custom metadata mirror. Must include {channel}, {component}, and {sha256}.
+# url_template = "https://your.server/{channel}/{component}/{sha256}.toml"
