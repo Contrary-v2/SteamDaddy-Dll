@@ -1,4 +1,6 @@
 #include "PatternLoader.h"
+#include "dllmain.h"
+#include "OSTPlatform/include/Encoding.h"
 #include "OSTPlatform/include/Memory.h"
 #include "OSTPlatform/include/Numbers.h"
 #include "Utils/Logging/Log.h"
@@ -6,8 +8,13 @@
 #include "Utils/SteamMetadata/SteamDiagnostics.h"
 #include "Utils/Support/FnvHash.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <filesystem>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -15,7 +22,6 @@
 #include <toml++/toml.hpp>
 
 // ---- compile-time sanity checks for FNV-1a table keys ----
-// If the steam-monitor bot uses the same algorithm these must hold.
 static_assert(Fnv1aHash("BBuildAndAsyncSendFrame") == 0x82428E37u,
               "FNV-1a mismatch for BBuildAndAsyncSendFrame");
 static_assert(Fnv1aHash("BuildDepotDependency") == 0xC37F2D8Eu,
@@ -33,20 +39,25 @@ struct PatternEntry {
 // key = Fnv1aHash(funcName)
 using PatternMap = std::unordered_map<uint32_t, PatternEntry>;
 
+// Global state synchronization
+static std::shared_mutex g_patternMutex;
+
 // module → its pattern map
 static std::unordered_map<OSTPlatform::DynamicLibrary::ModuleHandle, PatternMap> g_moduleMaps;
 
-// Modules whose Load() call failed (popup already shown). FindPattern
-// silently returns nullptr for these — without re-logging or adding the
-// function to g_missingFunctions — so we don't follow one "TOML missing"
-// popup with a second popup listing every dependent hook.
+// Requests recorded at Load() for inline self-healing on missing function entries
+static std::unordered_map<OSTPlatform::DynamicLibrary::ModuleHandle, RemoteToml::Request> g_moduleReqs;
+
+// Track modules that already had one refresh attempt in this session
+static std::unordered_set<OSTPlatform::DynamicLibrary::ModuleHandle> g_refreshedModules;
+
+// Modules whose Load() call failed (popup already shown). FindPattern silently returns nullptr
 static std::unordered_set<OSTPlatform::DynamicLibrary::ModuleHandle> g_failedModules;
 
 // functions whose names were not found during FindPattern
-static std::vector<std::string> g_missingFunctions;
+static std::unordered_set<std::string> g_missingFunctions;
 
 // ---- byte-pattern scanner ----
-
 static bool ParseSig(const std::string& str,
                      std::vector<uint8_t>& bytes,
                      std::vector<uint8_t>& mask)
@@ -98,9 +109,6 @@ static void* ScanModule(OSTPlatform::DynamicLibrary::ModuleHandle module,
 }
 
 // ---- TOML pattern parser ----
-
-// Section keys are hex literals like "0x82428E37"; each section is a table
-// with optional `name`, `rva` (hex string), and `sig` (IDA-style bytes).
 static PatternMap TableToPatternMap(const toml::table& tbl)
 {
     PatternMap map;
@@ -109,17 +117,24 @@ static PatternMap TableToPatternMap(const toml::table& tbl)
         if (!val.is_table()) continue;
         auto& sub = *val.as_table();
 
-        const auto parsedKey = OSTPlatform::Numbers::ParseHexUInt32(std::string(rawKey));
+        const auto parsedKey = OSTPlatform::Numbers::ParseHexUInt32(rawKey.str());
         if (!parsedKey) continue;
         const uint32_t hashKey = *parsedKey;
 
         PatternEntry entry;
         if (auto v = sub["name"].value<std::string>()) entry.name = *v;
+
+        // Dual-mode compatibility for string hex or native integer RVA
         if (auto v = sub["rva"].value<std::string>()) {
             if (const auto rva = OSTPlatform::Numbers::ParseHexUInt64(*v)) {
                 entry.rva = static_cast<uintptr_t>(*rva);
             }
+        } else if (auto v = sub["rva"].value<int64_t>()) {
+            if (*v > 0) {
+                entry.rva = static_cast<uintptr_t>(*v);
+            }
         }
+
         if (auto v = sub["sig"].value<std::string>()) entry.sig = *v;
 
         map[hashKey] = std::move(entry);
@@ -138,29 +153,25 @@ static PatternMap ParsePatternString(std::string_view body,
     }
 }
 
-// ---- popup helpers (detached threads so we never block Steam) ----
-
-// Surface a missing pattern file to the user, with enough detail to either
-// (a) drop a file in manually, (b) check the upstream repo, or (c) file
-// an actionable bug report.  We deliberately only disable hooks for the
-// failing module — the rest of OpenSteamTool keeps working.
+// ---- popup helpers ----
 static void ShowDownloadFailedPopup(const std::string& dllName,
                                     const std::string& sha256,
                                     const std::string& component)
 {
+    const std::string rootLabel = IsPortableMode() ? "<PortableDir>" : "<Steam>";
     SteamDiagnostics::ShowWarning(
-        "OpenSteamTool - Unsupported Steam Version",
-        "OpenSteamTool: signature file not found for " + dllName + ".\n\n"
+        "SteamDaddy - Unsupported Steam Version / 签名文件缺失",
+        "SteamDaddy: signature file not found for " + dllName + ".\n\n"
         "Hooks that depend on " + dllName + " are disabled for this session; "
         "other modules are unaffected.\n\n"
         "You can:\n"
-        "  1. Wait for the next signature update, then restart Steam.\n"
+        "  1. Wait for upstream signature update, then restart Steam.\n"
         "  2. Drop a matching TOML at:\n"
-        "       <Steam>\\opensteamtool\\pattern\\" + component + "\\" + sha256 + ".toml\n"
-        "  3. Check upstream:\n"
-        "       https://github.com/OpenSteam001/steam-monitor/tree/pattern/" + component + "\n"
-        "  4. Report the diagnostics below:\n"
-        "       https://github.com/OpenSteam001/OpenSteamTool/issues");
+        "       " + rootLabel + "\\steamdaddy\\pattern\\" + component + "\\" + sha256 + ".toml\n"
+        "  3. Check upstream repository:\n"
+        "       https://github.com/hazre/steam-monitor/tree/main/pattern/" + component + "\n"
+        "  4. Report diagnostics at:\n"
+        "       https://github.com/Contrary7/SteamDaddy-Backup/issues");
 }
 
 } // namespace
@@ -173,119 +184,190 @@ namespace PatternLoader {
 
 bool Load(OSTPlatform::DynamicLibrary::ModuleHandle module, const std::string& dllPath, const std::string& component)
 {
+    if (!module) return false;
+
     namespace fs = std::filesystem;
+    const RemoteToml::Request req{ kPatternChannel, component, dllPath };
+    const std::string dllName = fs::path(dllPath).filename().string();
 
-    // Delegate fetch + cache + mirror fallback to RemoteToml.
-    RemoteToml::Result r = RemoteToml::Fetch({
-        kPatternChannel,
-        component,
-        dllPath,
-    });
+    auto tryParse = [&](const RemoteToml::Result& res, PatternMap& out, std::string& err) -> bool {
+        if (!res.ok) return false;
+        out = ParsePatternString(res.body, &err);
+        return !out.empty();
+    };
 
-    if (r.ok) {
-        std::string parseErr;
-        PatternMap map = ParsePatternString(r.body, &parseErr);
-        if (!map.empty()) {
-            LOG_INFO("PatternLoader: loaded {} patterns for {} ({})",
-                     map.size(), component, r.fromCache ? "cache fallback" : "remote");
+    PatternMap map;
+    std::string parseErr;
+    RemoteToml::Result r = RemoteToml::Fetch(req);
+    if (tryParse(r, map, parseErr)) {
+        LOG_INFO("PatternLoader: loaded {} patterns for {} ({})",
+                 map.size(), component, r.fromCache ? "cache" : "remote");
+        std::unique_lock lock(g_patternMutex);
+        g_moduleMaps[module] = std::move(map);
+        g_moduleReqs[module] = req;
+        return true;
+    }
+
+    // Self-heal: stale or empty cache
+    if (r.ok && r.fromCache) {
+        LOG_WARN("PatternLoader: parsed empty spec for {} ({}), dropping stale cache and refetching once",
+                 component, parseErr.empty() ? "no entries" : parseErr);
+        RemoteToml::Invalidate(req);
+        r = RemoteToml::Fetch(req);
+        parseErr.clear();
+        if (tryParse(r, map, parseErr)) {
+            LOG_INFO("PatternLoader: self-heal ok, loaded {} patterns for {} ({})",
+                     map.size(), component, r.fromCache ? "cache" : "remote");
+            std::unique_lock lock(g_patternMutex);
             g_moduleMaps[module] = std::move(map);
+            g_moduleReqs[module] = req;
             return true;
         }
+    } else if (!r.ok) {
+        LOG_WARN("PatternLoader: download failed for {} (see RemoteToml log above)", component);
+    } else {
         LOG_WARN("PatternLoader: TOML for {} parsed empty ({})",
                  component, parseErr.empty() ? "no entries" : parseErr);
     }
 
-    // Total failure — popup + disable module's hooks.
-    std::string dllName = fs::path(dllPath).filename().string();
-    std::string sha     = r.sha256.empty() ? "(hash failed)" : r.sha256;
+    std::string sha = r.sha256.empty() ? "(hash failed)" : r.sha256;
     ShowDownloadFailedPopup(dllName, sha, component);
+    std::unique_lock lock(g_patternMutex);
     g_failedModules.insert(module);
     return false;
 }
 
 void* FindPattern(OSTPlatform::DynamicLibrary::ModuleHandle module, const char* funcName)
 {
-    // If the whole module's pattern file failed to load, stay quiet — the
-    // user already saw one popup and the main.log already has the warning.
-    // No point amplifying that into one log line per hook plus a second
-    // "missing functions" popup later.
-    if (g_failedModules.count(module)) {
-        return nullptr;
+    {
+        std::shared_lock lock(g_patternMutex);
+        if (g_failedModules.count(module)) {
+            return nullptr;
+        }
     }
 
     uint32_t key = Fnv1aHash(funcName);
 
-    auto mapIt = g_moduleMaps.find(module);
-    if (mapIt == g_moduleMaps.end()) {
-        // Load() was never called for this module.
-        LOG_WARN("PatternLoader: FindPattern called for module that was never loaded "
-                 "('{}')", funcName);
-        g_missingFunctions.emplace_back(funcName);
-        return nullptr;
-    }
+    {
+        std::shared_lock lock(g_patternMutex);
+        auto mapIt = g_moduleMaps.find(module);
+        if (mapIt == g_moduleMaps.end()) {
+            LOG_WARN("PatternLoader: FindPattern called for module that was never loaded ('{}')", funcName);
+            lock.unlock();
+            std::unique_lock wlock(g_patternMutex);
+            g_missingFunctions.insert(funcName);
+            return nullptr;
+        }
 
-    auto& map = mapIt->second;
-    auto entryIt = map.find(key);
-    if (entryIt == map.end()) {
-        LOG_WARN("PatternLoader: no entry for '{}' (key=0x{:08X})", funcName, key);
-        g_missingFunctions.emplace_back(funcName);
-        return nullptr;
-    }
-
-    const PatternEntry& entry = entryIt->second;
-
-    // Priority 1: RVA direct offset
-    if (entry.rva != 0) {
-        void* addr = reinterpret_cast<void*>(
-            reinterpret_cast<uintptr_t>(module) + entry.rva);
-        LOG_DEBUG("PatternLoader: {} resolved via RVA 0x{:X}", funcName, entry.rva);
-        return addr;
-    }
-
-    // Priority 2: byte-signature scan
-    if (!entry.sig.empty()) {
-        std::vector<uint8_t> bytes, mask;
-        if (ParseSig(entry.sig, bytes, mask)) {
-            void* addr = ScanModule(module, bytes, mask);
-            if (addr) {
-                uintptr_t rva = reinterpret_cast<uintptr_t>(addr) -
-                                reinterpret_cast<uintptr_t>(module);
-                LOG_DEBUG("PatternLoader: {} resolved via sig @ RVA 0x{:X}",
-                          funcName, rva);
+        const auto& map = mapIt->second;
+        auto entryIt = map.find(key);
+        if (entryIt != map.end()) {
+            const PatternEntry& entry = entryIt->second;
+            if (entry.rva != 0) {
+                void* addr = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(module) + entry.rva);
+                LOG_DEBUG("PatternLoader: {} resolved via RVA 0x{:X}", funcName, entry.rva);
                 return addr;
             }
-            LOG_WARN("PatternLoader: sig scan miss for '{}' (pattern parsed OK, "
-                     "no match in module image)", funcName);
-        } else {
-            LOG_WARN("PatternLoader: malformed sig for '{}': '{}'",
-                     funcName, entry.sig);
+            if (!entry.sig.empty()) {
+                std::vector<uint8_t> bytes, mask;
+                if (ParseSig(entry.sig, bytes, mask)) {
+                    void* addr = ScanModule(module, bytes, mask);
+                    if (addr) {
+                        uintptr_t rva = reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(module);
+                        LOG_DEBUG("PatternLoader: {} resolved via sig @ RVA 0x{:X}", funcName, rva);
+                        return addr;
+                    }
+                    LOG_WARN("PatternLoader: sig scan miss for '{}'", funcName);
+                }
+            }
         }
-    } else {
-        LOG_WARN("PatternLoader: entry for '{}' has neither rva nor sig", funcName);
     }
 
-    g_missingFunctions.emplace_back(funcName);
+    // Subset refresh: if function was absent from cache, invalidate and refresh once
+    bool canRefresh = false;
+    RemoteToml::Request reqToRefresh;
+    {
+        std::unique_lock lock(g_patternMutex);
+        if (!g_refreshedModules.count(module)) {
+            g_refreshedModules.insert(module);
+            auto reqIt = g_moduleReqs.find(module);
+            if (reqIt != g_moduleReqs.end()) {
+                reqToRefresh = reqIt->second;
+                canRefresh = true;
+            }
+        }
+    }
+
+    if (canRefresh) {
+        LOG_WARN("PatternLoader: '{}' not in cached spec, dropping possibly-stale subset and refetching once", funcName);
+        RemoteToml::Invalidate(reqToRefresh);
+        RemoteToml::Result r = RemoteToml::Fetch(reqToRefresh);
+        if (r.ok) {
+            std::string refreshErr;
+            PatternMap fresh = ParsePatternString(r.body, &refreshErr);
+            if (!fresh.empty()) {
+                std::unique_lock lock(g_patternMutex);
+                auto& map = g_moduleMaps[module];
+                LOG_INFO("PatternLoader: subset refresh ok, {} -> {} entries ({})",
+                         map.size(), fresh.size(), r.fromCache ? "cache" : "remote");
+                map = std::move(fresh);
+                auto entryIt = map.find(key);
+                if (entryIt != map.end()) {
+                    const PatternEntry& entry = entryIt->second;
+                    if (entry.rva != 0) {
+                        void* addr = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(module) + entry.rva);
+                        LOG_DEBUG("PatternLoader: {} resolved via RVA 0x{:X} after refresh", funcName, entry.rva);
+                        return addr;
+                    }
+                    if (!entry.sig.empty()) {
+                        std::vector<uint8_t> bytes, mask;
+                        if (ParseSig(entry.sig, bytes, mask)) {
+                            void* addr = ScanModule(module, bytes, mask);
+                            if (addr) {
+                                LOG_DEBUG("PatternLoader: {} resolved via sig after refresh", funcName);
+                                return addr;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    LOG_WARN("PatternLoader: no entry for '{}' (key=0x{:08X})", funcName, key);
+    std::unique_lock lock(g_patternMutex);
+    g_missingFunctions.insert(funcName);
     return nullptr;
+}
+
+void RefreshMissingMetadata()
+{
+    // Compatible no-op: subset refresh runs inline during FindPattern
 }
 
 void ReportMissingFunctions()
 {
-    if (g_missingFunctions.empty()) return;
+    std::vector<std::string> missing;
+    {
+        std::unique_lock lock(g_patternMutex);
+        if (g_missingFunctions.empty()) return;
+        missing.assign(g_missingFunctions.begin(), g_missingFunctions.end());
+        g_missingFunctions.clear();
+    }
+    std::sort(missing.begin(), missing.end());
 
-    // Build the list
     std::string list;
-    for (const auto& name : g_missingFunctions)
+    for (const auto& name : missing) {
         list += "  - " + name + "\n";
-    g_missingFunctions.clear();
+    }
 
     SteamDiagnostics::ShowWarning(
-        "OpenSteamTool - Missing Signatures",
-        "OpenSteamTool: some functions could not be located.\n\n"
-        "The following functions were not found in the signature file:\n" +
+        "SteamDaddy - Missing Signatures / 签名缺失",
+        "SteamDaddy: some functions could not be located in this Steam build.\n\n"
+        "Missing functions:\n" +
         list +
-        "\nHooks for these functions are disabled for this session.\n\n"
-        "Please report this at:\n"
-        "https://github.com/OpenSteam001/OpenSteamTool/issues");
+        "\nHooks for these functions are disabled for this session.\n"
+        "Please report to: https://github.com/Contrary7/SteamDaddy-Backup/issues");
 }
 
 } // namespace PatternLoader
