@@ -20,8 +20,10 @@ namespace ProcessInspector {
         "gameoverlayui64.exe",
     };
 
-    inline constexpr std::array<std::string_view, 3> kToolProcessNames = {
+    inline constexpr std::array<std::string_view, 5> kToolProcessNames = {
         "extract_tickets.exe",
+        "ost-manager.exe",
+        "ost-loader.exe",
         "ost-injector.exe",
         "injector.exe",
     };

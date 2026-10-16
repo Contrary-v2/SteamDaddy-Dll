@@ -95,13 +95,12 @@ namespace {
         if (pattern.empty()) return true;
         if (cmdLine.empty()) return false;
 
-        // If the pattern starts with a command-line switch character, use token boundary matching
-        if ((pattern.front() == '-' || pattern.front() == '/') &&
-            DenuvoAuth::HasCmdLineArg(cmdLine.c_str(), pattern.c_str())) {
-            return true;
+        // If the pattern starts with a command-line switch character, use token boundary matching strictly
+        if (pattern.front() == '-' || pattern.front() == '/') {
+            return DenuvoAuth::HasCmdLineArg(cmdLine.c_str(), pattern.c_str());
         }
 
-        // Case-insensitive substring fallback
+        // Case-insensitive substring fallback for non-switch tokens (module names, paths, etc.)
         auto it = std::search(
             cmdLine.begin(), cmdLine.end(),
             pattern.begin(), pattern.end(),
