@@ -1,8 +1,9 @@
 #pragma once
 #include "Steam/Types.h"
 #include "Steam/Structs.h"
-#include "IPCMessages.gen.h"
+#include <format>
 #include <span>
+#include <string>
 
 using IPCHandlerFn = void(*)(CPipeClient* pipe,CUtlBuffer* pRead, CUtlBuffer* pWrite);
 
