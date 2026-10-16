@@ -50,15 +50,9 @@ Architecture DetectArchitecture(HANDLE process) {
 #endif
 }
 
-std::wstring Lower(std::wstring value) {
-    for (wchar_t& ch : value) {
-        if (ch >= L'A' && ch <= L'Z') ch = static_cast<wchar_t>(ch - L'A' + L'a');
-    }
-    return value;
-}
-
-bool EqualsInsensitive(std::wstring_view lhs, std::wstring_view rhs) {
-    return Lower(std::wstring(lhs)) == Lower(std::wstring(rhs));
+bool EqualsInsensitive(std::wstring_view lhs, std::wstring_view rhs) noexcept {
+    if (lhs.size() != rhs.size()) return false;
+    return _wcsnicmp(lhs.data(), rhs.data(), lhs.size()) == 0;
 }
 
 std::wstring ModuleNameFromForwarder(std::string_view name) {
@@ -74,9 +68,15 @@ std::vector<RemoteModule> EnumerateRemoteModules(uint32_t pid, Architecture arch
         ? TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32
         : TH32CS_SNAPMODULE;
 
-    Windows::UniqueFileHandle snapshot(CreateToolhelp32Snapshot(flags, pid));
-    if (!snapshot && architecture == Architecture::X86) {
-        snapshot = Windows::UniqueFileHandle(CreateToolhelp32Snapshot(TH32CS_SNAPMODULE32, pid));
+    Windows::UniqueFileHandle snapshot;
+    for (int retry = 0; retry < 5; ++retry) {
+        snapshot.Reset(CreateToolhelp32Snapshot(flags, pid));
+        if (!snapshot && architecture == Architecture::X86) {
+            snapshot.Reset(CreateToolhelp32Snapshot(TH32CS_SNAPMODULE32, pid));
+        }
+        if (snapshot) break;
+        if (GetLastError() != ERROR_BAD_LENGTH) break;
+        Sleep(10);
     }
     if (!snapshot) {
         OSTP_LOG_WARN("CreateToolhelp32Snapshot(pid={}, flags=0x{:X}) failed (error={})",
@@ -107,9 +107,9 @@ const RemoteModule* FindModule(std::span<const RemoteModule> modules, std::wstri
     return nullptr;
 }
 
-bool StartsWithInsensitive(std::wstring_view value, std::wstring_view prefix) {
+bool StartsWithInsensitive(std::wstring_view value, std::wstring_view prefix) noexcept {
     if (value.size() < prefix.size()) return false;
-    return EqualsInsensitive(value.substr(0, prefix.size()), prefix);
+    return _wcsnicmp(value.data(), prefix.data(), prefix.size()) == 0;
 }
 
 std::optional<uintptr_t> ResolveRemoteExport(
@@ -132,7 +132,7 @@ std::optional<uintptr_t> ResolveRemoteExport(
     const auto exported = image.FindExport(symbolName);
     if (!exported) {
         OSTP_LOG_WARN("ResolveRemoteExport: export {}!{} not found",
-                      module->path.string(), std::string(symbolName));
+                      Encoding::PathToUtf8(module->path), std::string(symbolName));
         return std::nullopt;
     }
 
@@ -168,7 +168,7 @@ LPTHREAD_START_ROUTINE ResolveRemoteLoadLibraryW(uint32_t pid, Architecture arch
 
 } // namespace
 
-const char* ToString(Architecture architecture) {
+const char* ToString(Architecture architecture) noexcept {
     switch (architecture) {
     case Architecture::Unknown: return "Unknown";
     case Architecture::X86: return "X86";
@@ -177,7 +177,7 @@ const char* ToString(Architecture architecture) {
     return "Unknown";
 }
 
-const char* ToString(InjectStatus status) {
+const char* ToString(InjectStatus status) noexcept {
     switch (status) {
     case InjectStatus::Ok: return "Ok";
     case InjectStatus::OpenProcessFailed: return "OpenProcessFailed";
@@ -205,7 +205,12 @@ Architecture GetArchitecture(uint32_t pid) {
 }
 
 InjectStatus InjectLibrary(uint32_t pid, const std::filesystem::path& libraryPath) {
-    Windows::UniqueHandle process(pid ? OpenProcess(kInjectAccess, FALSE, pid) : nullptr);
+    if (pid == 0 || libraryPath.empty()) {
+        OSTP_LOG_WARN("InjectLibrary: invalid parameters (pid={}, empty_path={})", pid, libraryPath.empty());
+        return InjectStatus::OpenProcessFailed;
+    }
+
+    Windows::UniqueHandle process(OpenProcess(kInjectAccess, FALSE, pid));
     if (!process) {
         OSTP_LOG_WARN("OpenProcess(pid={}, access=0x{:X}) failed (error={})", pid, kInjectAccess, GetLastError());
         return InjectStatus::OpenProcessFailed;
@@ -222,7 +227,7 @@ InjectStatus InjectLibrary(uint32_t pid, const std::filesystem::path& libraryPat
         return InjectStatus::ResolveLoadLibraryFailed;
     }
 
-    const std::wstring nativePath = libraryPath.wstring();
+    const std::wstring_view nativePath = libraryPath.native();
     const size_t byteSize = (nativePath.size() + 1) * sizeof(wchar_t);
     void* remotePath = VirtualAllocEx(process.get(), nullptr, byteSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!remotePath) {
@@ -237,7 +242,7 @@ InjectStatus InjectLibrary(uint32_t pid, const std::filesystem::path& libraryPat
     });
 
     SIZE_T written = 0;
-    if (!WriteProcessMemory(process.get(), remotePath, nativePath.c_str(), byteSize, &written) ||
+    if (!WriteProcessMemory(process.get(), remotePath, nativePath.data(), byteSize, &written) ||
         written != byteSize) {
         OSTP_LOG_WARN("WriteProcessMemory(size={}) failed (written={}, error={})",
                       byteSize, static_cast<size_t>(written), GetLastError());
@@ -257,8 +262,11 @@ InjectStatus InjectLibrary(uint32_t pid, const std::filesystem::path& libraryPat
             OSTP_LOG_WARN("WaitForSingleObject(remote thread) failed (error={})", GetLastError());
         } else if (wait == WAIT_TIMEOUT) {
             OSTP_LOG_WARN("WaitForSingleObject(remote thread) timed out after {} ms", kRemoteLoadTimeoutMs);
+            // Remote thread may still be executing LoadLibraryW. Do NOT free remotePath under a living thread.
+            freeRemotePath.Dismiss();
         } else {
             OSTP_LOG_WARN("WaitForSingleObject(remote thread) returned unexpected status {}", wait);
+            freeRemotePath.Dismiss();
         }
         return InjectStatus::WaitFailed;
     }
@@ -269,7 +277,7 @@ InjectStatus InjectLibrary(uint32_t pid, const std::filesystem::path& libraryPat
         return InjectStatus::RemoteLoadFailed;
     }
     if (exitCode == 0) {
-        OSTP_LOG_WARN("Remote LoadLibraryW returned 0 for '{}'", libraryPath.string());
+        OSTP_LOG_WARN("Remote LoadLibraryW returned 0 for '{}'", Encoding::PathToUtf8(libraryPath));
         return InjectStatus::RemoteLoadFailed;
     }
 

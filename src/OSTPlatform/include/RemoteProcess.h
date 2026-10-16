@@ -23,9 +23,9 @@ namespace OSTPlatform::RemoteProcess {
         RemoteLoadFailed,
     };
 
-    const char* ToString(Architecture architecture);
-    const char* ToString(InjectStatus status);
-    Architecture GetArchitecture(uint32_t pid);
-    InjectStatus InjectLibrary(uint32_t pid, const std::filesystem::path& libraryPath);
+    [[nodiscard]] const char* ToString(Architecture architecture) noexcept;
+    [[nodiscard]] const char* ToString(InjectStatus status) noexcept;
+    [[nodiscard]] Architecture GetArchitecture(uint32_t pid);
+    [[nodiscard]] InjectStatus InjectLibrary(uint32_t pid, const std::filesystem::path& libraryPath);
 
 } // namespace OSTPlatform::RemoteProcess
