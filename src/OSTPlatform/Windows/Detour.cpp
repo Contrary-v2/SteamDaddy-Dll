@@ -21,13 +21,20 @@ bool DetourSucceeded(LONG result, const char* operation) {
 bool BeginTransaction() {
     const LONG begin = DetourTransactionBegin();
     if (!DetourSucceeded(begin, "DetourTransactionBegin")) return false;
-    return DetourSucceeded(
-        DetourUpdateThread(Thread::CurrentNativeThreadHandle()),
-        "DetourUpdateThread");
+    const LONG update = DetourUpdateThread(Thread::CurrentNativeThreadHandle());
+    if (!DetourSucceeded(update, "DetourUpdateThread")) {
+        DetourTransactionAbort();
+        return false;
+    }
+    return true;
 }
 
 bool CommitTransaction() {
     return DetourSucceeded(DetourTransactionCommit(), "DetourTransactionCommit");
+}
+
+bool AbortTransaction() {
+    return DetourSucceeded(DetourTransactionAbort(), "DetourTransactionAbort");
 }
 
 bool Attach(void** target, void* detour) {
