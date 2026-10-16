@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <string_view>
 
-#ifdef OPENSTEAMTOOL_LOGGING_ENABLED
+#ifdef STEAMDADDY_LOGGING_ENABLED
 #include <format>
 #endif
 
@@ -28,7 +28,7 @@ void Dispatch(Level level, const Source& src, std::string_view msg) noexcept;
 
 } // namespace OSTPlatform::Log
 
-#ifdef OPENSTEAMTOOL_LOGGING_ENABLED
+#ifdef STEAMDADDY_LOGGING_ENABLED
 #define OSTP_LOG(lvl, ...)                                            \
     ::OSTPlatform::Log::Dispatch(                                     \
         (lvl),                                                        \

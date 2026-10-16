@@ -13,6 +13,10 @@
 //    2. Run CMake configure (LOG_NEWMOD_* macros are auto-generated).
 // ─────────────────────────────────────────────────────────────────
 
+#ifndef OST_MOD
+#error "OST_MOD(varName, fileName) must be defined before including LogModules.def"
+#endif
+
 OST_MOD(IPC,           "ipc")
 OST_MOD(NetPacket,     "netpacket")
 OST_MOD(Manifest,      "manifest")
@@ -25,5 +29,6 @@ OST_MOD(OnlineFix,     "onlinefix")
 OST_MOD(RichPresence,  "richpresence")
 OST_MOD(Package,       "package")
 OST_MOD(SteamUI,       "steamui")
+OST_MOD(Inject,        "inject")
 OST_MOD(Pipe,          "pipe")
 OST_MOD(Platform,      "platform")
