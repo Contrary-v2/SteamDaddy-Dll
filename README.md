@@ -1,270 +1,295 @@
 <div align="center">
-  <img src="docs/logo-animated.svg" width="180" alt="OpenSteamTool logo">
+  <img src="docs/logo.png" width="180" alt="SteamDaddy logo">
 
-  <h1>OpenSteamTool</h1>
+  <h1>SteamDaddy DLLs</h1>
 
   <p>
-    <strong>Open-Source Steam Unlock Tool</strong>
+    <strong>High-Performance Steam Unlock, Ticket Generation & Manifest Management Engine</strong>
   </p>
 
   <p>
     <img src="https://img.shields.io/badge/C%2B%2B-20%2B-2ea44f?logo=cplusplus&logoColor=white" alt="C++ 20+">
     <img src="https://img.shields.io/badge/CMake-3.20%2B-2ea44f?logo=cmake&logoColor=white" alt="CMake 3.20+">
     <img src="https://img.shields.io/badge/Windows-only-d73a49?logo=windows&logoColor=white" alt="Windows only">
-    <a href="https://deepwiki.com/OpenSteam001/OpenSteamTool">
-      <img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki">
+    <a href="https://github.com/Contrary7/SteamDaddy-Dlls">
+      <img src="https://img.shields.io/badge/GitHub-Contrary7%2FSteamDaddy--Dlls-blue?logo=github" alt="Repository">
     </a>
-  </p>
-
-  <p>
-    <a href="README.md">
-      <img src="https://flagcdn.com/w40/us.png" width="22" alt="United States flag">
-      English
-    </a>
-    &nbsp;|&nbsp;
-    <a href="README_ES.md">
-      <img src="https://flagcdn.com/w40/es.png" width="22" alt="Spain flag">
-      Español
-    </a>
-    &nbsp;|&nbsp;
-    <a href="README_ZH.md">
-      <img src="https://flagcdn.com/w40/cn.png" width="22" alt="China flag">
-      中文
+    <a href="https://github.com/Contrary7/SteamDaddy-Backup">
+      <img src="https://img.shields.io/badge/Ecosystem-SteamDaddy--Backup-orange?logo=steam" alt="Main Project">
     </a>
   </p>
 </div>
 
-## Feature
+---
 
-### Core Unlocks
-- Unlock an unlimited number of unowned games.
-- Unlock all DLCs for unowned games.
-- Support auto load depot decryption keys from Lua config.
-- Support auto manifest download via `opensteamtool` / `steamrun` / `wudrm` upstream APIs (default is `opensteamtool`), or a custom Lua endpoint (see [Manifest via Lua](#manifest-via-lua)).
-- Support downloading protected games or DLCs that require an access token.
-- Support binding manifest to prevent specific games from being updated.
+## Overview
+
+**SteamDaddy** is an advanced C++20 user-space dynamic instrumentation engine for the Valve Steam client. Loaded via Windows PE sideloading (`version.dll` or `dwmapi.dll`), SteamDaddy intercepts Steam client IPC protocols, packet structures, and memory interfaces to deliver transparent DLC and game unlocking, automated depot manifest resolution with failover, donor ticket generation, offline Denuvo/SteamStub authorization, third-party CDKey resolution, and cloud save redirection.
+
+> [!TIP]
+> **Better Together with SteamDaddy (Main Ecosystem):**  
+> This repository contains the standalone, low-level C++ binaries (`SteamDaddy.dll`, `version.dll`, `dwmapi.dll`).  
+> For the complete end-user experience—including an intuitive GUI, 1-click game unlocking, ContraryCDN API integration, auto-patching online fixes, achievement syncing, and native Millennium UI integration directly inside your Steam client—we strongly recommend using this core alongside the primary **SteamDaddy** platform maintained at:  
+> 
+> 👉 **[Contrary7/SteamDaddy-Backup](https://github.com/Contrary7/SteamDaddy-Backup)** — *The ultimate SteamTools alternative & manifest manager.*
+
+---
+
+## Features
+
+### Core Unlocks & Manifest Management
+* **Zero-Limit App & DLC Unlocking**: Register an unlimited number of games and DLCs via Lua scripts in `<Steam>/config/stplug-in/`.
+* **Depot Decryption Key Injection**: Automatically resolves and supplies depot decryption keys on demand from Lua definitions.
+* **Multi-Upstream Manifest Engine with Automatic Failover**:
+  Queries upstream APIs in priority order with sequential failover and a 60-second cooldown per failed upstream:
+  1. `20770407` (`https://20770407.xyz/manifest/{depotId}/{gid}`) — **Default**
+  2. `SDM` (`https://steamapi.993499094.xyz/manifest/{depotId}/{gid}`)
+  3. `manifestdex` (`https://manifest.manifestdex.com/{gid}`)
+  4. `wudrm` (`http://gmrc.wudrm.com/manifest/{gid}`)
+  5. `steamrun` (`https://manifest.steam.run/api/manifest/{gid}`)
+  6. `opensteamtool` (`https://manifest.opensteamtool.com/{gid}`)
+* **Custom Lua Manifest Endpoints**: Define `fetch_manifest_code(gid)` or `fetch_manifest_code_ex(app_id, depot_id, gid)` in `config/stplug-in/manifest.lua` using built-in `http_get` and `http_post` functions.
+* **Manifest Pinning & Locking (`setManifestid`)**: Pin specific depot manifest versions to prevent unwanted game updates and preserve offline Denuvo activations.
+* **Ownership-Aware Manifest Locking (`lock_owned_games`)**: When set to `false` (default), genuinely owned games receive official updates normally, while unowned games remain locked.
+* **Background Auto-Sync on Update (`auto_sync_on_update`)**: Automatically updates local `.lua` configurations and manifest cache mirrors in the background as soon as Steam finishes downloading an update.
+* **Automatic Depot Cache Mirroring**: Downloaded `.manifest` files are automatically mirrored directly into `<Steam>/depotcache/`.
+
+### Third-Party Retail Keys ("Updating product key" Fix)
+* **Legacy CDKey Protocol Emulation**: Intercepts `MsgClientGetLegacyGameKey` packets for external publisher launchers (Ubisoft Connect, EA, Rockstar).
+* **Synthetic Fallback**: When no key is defined with `setlegacycdkey(appid, "KEY")`, SteamDaddy generates a deterministic synthetic key locally so Steam completes the client-side registration step without hanging.
+
+### Denuvo & SteamStub Protection Compatibility
+* **SteamStub Compatibility**: AppID spoofing via local ConfigStore tickets exploiting a SteamDRMP off-by-four ticket parsing vulnerability—no game process injection required.
+* **Platform Credential Store Integration**: Explicit `AppTicket` and `ETicket` hex strings configured via `setAppTicket(appid, "hex")` and `setETicket(appid, "hex")` are stored in `HKCU\Software\Valve\Steam\Apps\<AppId>\AppTicket`.
+* **Scheme 2 Multi-Stage Adaptive Leasing (`-dauth2` / `dauth2(appid)`)**: Dynamically extends ticket lease windows for titles with strict timeout windows.
+* **Helper Launch Options**:
+  * `-dauth2`: Enable Scheme 2 adaptive ticket lease extension.
+  * `-d+` (alias `-lua`): Auto-generates `<AppId>.lua` and locks manifests when launched from an account that genuinely owns the game.
+  * `-forcedenuvo`: Force treat the game as Denuvo-protected (or `forcedenuvo(appid)` in Lua).
+  * `-nodenuvo`: Bypass Denuvo ticket handling entirely (or `nodenuvo(appid)` in Lua).
+* **30-Minute Validity Window**: Denuvo tokens have a 30-minute validity window. If authorization expires (Denuvo error `88500005`), refresh tickets from a genuine owning account.
+
+### Ticket & Credential Extraction (`extract_tickets`)
+Extracts `AppTicket`, `ETicket`, DLC lists, depot keys, manifests, and auto-generates `<appid>.lua` on genuine accounts:
+* **Interactive Terminal UI (TUI)**: Run `extract_tickets.exe` directly without arguments for an interactive console UI with account switching and library search.
+* **Clientless Online Mode (`--online` / `-o`)**: Connects directly to Valve Connection Manager (Steam CM) servers over TCP/TLS for headless extraction with QR-code or saved credentials—no local Steam client required!
+* **CLI Commands**:
+  ```powershell
+  # Interactive TUI mode
+  extract_tickets.exe
+
+  # Standard extraction for locally installed game
+  extract_tickets.exe 1361510
+
+  # Force ETicket extraction for uninstalled game
+  extract_tickets.exe 1361510 --force-eticket
+
+  # Headless online extraction via Steam CM servers
+  extract_tickets.exe --online --appid 1361510
+  ```
+
+### Online Fix & Multiplayer
+* **Spacewar Matchmaking (`-onlinefix`)**: Add `-onlinefix` to Steam launch parameters to enable AppID 480 matchmaking while preserving save isolation and real AppID reporting.
+* **P2P Certificate Flip (`-p2pflip`)**: Add `-onlinefix -p2pflip` for rare multiplayer titles requiring strict 480 certificate matching in P2P handshakes.
+
+### Family Sharing Bypass
+* **Zero-Configuration Bypass**: The lender's library is never locked, and borrowed games lose their borrowed and license-locked status flags.
+
+### Stats & Achievements
+* **Achievement & Stat Tracking**: Enables statistics and achievements for unlocked unowned games.
+* **Resolution Priority**:
+  1. Lua Override: `setStat(appid, "steamid")`
+  2. Live Upstream API: `https://stats.opensteamtool.com/{appid}` (queried automatically when `[stats] enable_api = true`)
+  3. Default Preset SteamID: `76561198028121353`
+
+### Cloud Save Redirection (CloudRedirect)
+* Integrates [CloudRedirect](https://github.com/Selectively11/CloudRedirect) to redirect cloud save RPCs to external storage providers (Google Drive, OneDrive, local directories) while preserving memory isolation.
+
+### Dynamic Binary Instrumentation & Pattern Engine
+* **0ms Early Chokepoint Detours**: `Hooks_Diversion` traps `KERNELBASE!LoadLibraryExW` at process startup to ensure zero race conditions before Steam components load.
+* **Multi-Pattern IDA Signature Scanner**: Scans runtime binary code using IDA byte signatures (`sig`) with multi-pattern fallback and dual-mode RVAs.
+* **Remote TOML Fallback & Cache Refresh**: Downloads metadata with failover between `gh-proxy.com` and GitHub, with automatic cache invalidation on signature drift.
+
+### Game Process Injection
+* Inject third-party DLLs into game processes via `[[inject]]` in `steamdaddy.toml`.
+* Built-in global anti-cheat exclusion list (`[injects].exclude_appids`) protecting ~20 competitive titles (CS2, Dota 2, Apex, PUBG, etc.) from accidental injection.
 
 ### Hot Reload
-- Adding, modifying, deleting, or overwriting `.lua` files in any watched directory automatically triggers a reload. No restart, no offline/online toggle needed.
+* Watched `<Steam>/config/stplug-in/` directories and `steamdaddy.toml` reload additions and modifications instantly without restarting Steam.
 
-### Injection
-- Add optional game-process library injection through `[inject]` in `opensteamtool.toml`.
-- Configure `enabled`, `library_x64`, and `library_x86`; the injected library must match the target process architecture.`library_x64` and `library_x86` may be absolute paths, or relative paths resolved from the Steam root directory.
+---
 
-### Family Sharing and Remote Play
-- Bypass Steam Family Sharing restrictions for games that have been added to the library with `addappid` in Lua. All accounts in the Steam Family that participate in sharing must use OpenSteamTool for this to work.
+## Quick Start & Installation
 
-### Compatible with games protected by Denuvo and SteamStub
-- SteamStub-only games do not require configuring `AppTicket`. OpenSteamTool can reuse Steam's local ConfigStore ticket and forge the requested AppId through a SteamDRMP off-by-four ticket parsing vulnerability, without injecting into the game process.
-- Denuvo-protected games still require explicit ticket data. OpenSteamTool stores `AppTicket` and `ETicket` through the platform credential store.
-- Use `setAppTicket(appid, "hex")` and `setETicket(appid, "hex")` in Lua config to write these values to the platform credential store automatically.
-- Denuvo verification has a 30-minute validity window. After this window expires, authorization may fail with Denuvo error code `88500005`; refresh the ticket data before retrying.
-- AppTicket priority: explicit tickets have the highest priority, including tickets configured by `setAppTicket` and existing cached `AppTicket` credential values. If no explicit AppTicket is available, OpenSteamTool falls back to the forged local ConfigStore ticket path.
-- SteamID priority: read cached `SteamID` first; if missing, parse from explicit `AppTicket`. On Windows, the credential store backend currently uses `HKCU\Software\Valve\Steam\Apps\<AppId>`. The Linux backend is not implemented yet.
+### 🚀 1-Click Automated Installer (Recommended)
 
-#### Extracting tickets with `extract_tickets`
+To automatically download, configure, and inject SteamDaddy straight into your Steam client in seconds:
 
-The `extract_tickets` tool dumps the `AppTicket` and `ETicket` hex strings you need for `setAppTicket` / `setETicket`. Run it on a machine where Steam is running and logged into an account that **owns** the target game.
-
-1. Build the tools (see [Build](#build)); the binary lands in `build/tools/Release/extract_tickets.exe`.
-2. Run it with the target AppId (or run it with no argument and type the AppId when prompted):
-   ```powershell
-   extract_tickets.exe 1361510
-   ```
-3. It reads the Steam install path from the registry, loads `steamclient64.dll`, and writes everything into an `<appid>/` folder next to the executable:
-   - `appticket.bin` — raw app ownership ticket (binary)
-   - `eticket.bin` — raw encrypted app ticket (binary)
-   - `tickets.txt` — plain-text summary with the hex strings:
-     ```
-     appid:1361510
-     appticket(184 bytes):14000000...
-     eticket(143 bytes):...
-     ```
-   A ticket that could not be obtained is reported as `appticket:null` / `eticket:null`.
-4. Paste the hex strings from `tickets.txt` into your Lua config:
-   ```lua
-   setAppTicket(1361510, "14000000...")
-   setETicket(1361510, "...")
-   ```
-
-> **Note:** Tickets are only valid when extracted from an account that **genuinely owns** the game.
-
-### Stats and Achievements
-- Enable stats and achievements for unowned games.
-- Uses `setStat(appid, "steamid")` to configure which SteamID's achievement data to pull.
-- If no `setStat` is configured for an app, OpenSteamTool queries `https://stats.opensteamtool.com/{appid}` when `[stats] enable_api = true` (default).
-- Priority: `setStat` > stats API when enabled and valid > hardcoded preset SteamID `76561198028121353`.
-
-### Online Fix
-- Add `-onlinefix` to the Steam launch parameters to enable 480-based online play in games that use lobby matchmaking. The current limitation is that only one such game can run at a time.To revert, simply remove -onlinefix from the launch parameters — online play returns to normal on the next launch.
-
-## Future
-- Steam Cloud synchronization support.(This is a huge project)
-
-## Usage
-1. Run `build.bat` from the project root to build the project.
-2. Copy generated `dwmapi.dll`, `xinput1_4.dll` and `OpenSteamTool.dll` to the Steam root directory.
-3. Create Lua directory (for example `C:\steam\config\lua`) and place Lua scripts there. The DLL will automatically load and execute them.
-4. Lua example:
-```lua
-addappid(1361510) -- unlock game with appid 1361510
-
-addappid(1361511, 0,"5954562e7f5260400040a818bc29b60b335bb690066ff767e20d145a3b6b4af0") -- unlock game with appid 1361511 depotKey is "5954562e7f5260400040a818bc29b60b335bb690066ff767e20d145a3b6b4af0" 
-
-addtoken(1361510,"2764735786934684318") -- add access token ("2764735786934684318") for game with appid 1361510 
--- No Longer Supported:
---pinApp(1361510) -- pin game with appid 1361510 to prevent it from being updated
-
-setManifestid(1361511,"5656605350306673283") -- pin depotid:1361511 manifest_gid:5656605350306673283, size defaults to 0
-setManifestid(1361511,"5656605350306673283", 12345678) -- same but with explicit size
-
-setAppTicket(1361510,"0100000000000000...") -- write AppTicket to the credential store; on Windows: HKCU\Software\Valve\Steam\Apps\1361510\AppTicket
-
-setETicket(1361510,"0100000000000000...") -- write ETicket to the credential store; on Windows: HKCU\Software\Valve\Steam\Apps\1361510\ETicket
-
-setStat(1361510, "76561197960287930") -- use the specified SteamID's achievement data for appid 1361510
--- If not configured, the stats API is used when enabled; otherwise default SteamID 76561198028121353 is used.
+**Via PowerShell (Run as Administrator):**
+```powershell
+irm https://raw.githubusercontent.com/Contrary7/SteamDaddy-Backup/main/install_b.ps1 | iex
 ```
 
-All function names are **case-insensitive**. `setAppTicket`, `setappticket`, `SetAppticket`, `SETAPPTICKET` etc. are all equivalent. The same applies to every registered function (`addAppId`, `AddToken`, `SETManifestid`, etc.).
+**Via Command Prompt (`cmd.exe` as Administrator):**
+```cmd
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/Contrary7/SteamDaddy-Backup/main/install_b.ps1 | iex"
+```
 
-### Configuration (optional)
+---
 
-Rename `opensteamtool.example.toml` to `opensteamtool.toml` and place it in the Steam root directory (next to `steam.exe`).
-If no config file is found, built-in defaults are used — no auto-creation.
-The file is watched while Steam is running; valid changes are hot-reloaded without restarting Steam.
+### Manual Sideload DLL Proxy Mode
+
+1. Build or download `SteamDaddy.dll` and `version.dll` (or `dwmapi.dll`).
+2. Copy the files into your Steam directory:
+   * **`SteamDaddy.dll`** → `<Steam Root>\SteamDaddy.dll`
+   * **`version.dll`** → `<Steam Root>\version.dll`
+3. Create the Lua script directory:
+   * `<Steam Root>\config\stplug-in\`
+4. *(Optional)* Copy `steamdaddy.example.toml` to `<Steam Root>\steamdaddy.toml` to customize settings.
+5. Launch Steam normally. Windows automatically sideloads `version.dll`, which loads `SteamDaddy.dll` into `steam.exe`.
+
+> [!WARNING]
+> **Modern Steam Notice (`dwmapi.dll` vs `version.dll`):**  
+> On recent Steam client builds, deploying `dwmapi.dll` into the Steam root folder can trigger a `VGUI_Setup failed` startup crash. We strongly recommend using **`version.dll`** as your sideload proxy. If you previously deployed `dwmapi.dll`, delete it from your Steam root.
+
+---
+
+## Configuration (`steamdaddy.toml`)
+
+Copy `steamdaddy.example.toml` to `steamdaddy.toml` in your Steam directory or portable folder. SteamDaddy automatically detects and hot-reloads this file.
 
 ```toml
 [log]
-# Debug build only.  Level: trace, debug, info, warn, error
+# Debug builds only: trace, debug, info, warn, error
 level = "info"
+# Directory for debug logs (optional)
+# dir = "steamdaddy"
 
 [manifest]
-# Upstream API for depot manifest request codes.  Options: "opensteamtool", "steamrun", "wudrm"
-url = "opensteamtool"
-
-# HTTP timeouts for manifest requests (milliseconds)
+# Upstream API: "20770407" (default), "SDM", "manifestdex", "wudrm", "steamrun", "opensteamtool"
+url = "20770407"
+failover = true
 timeout_resolve_ms = 5000
 timeout_connect_ms = 5000
 timeout_send_ms    = 10000
 timeout_recv_ms    = 10000
+lock_owned_games = false
+auto_sync_on_update = true
 
 [stats]
-# Query https://stats.opensteamtool.com/{appid} when no Lua setStat override exists.
-# Priority: setStat > stats API > hardcoded preset SteamID.
+# Query stats API when setStat is absent
 enable_api = true
 
-# Additional Lua config directories (optional).
-# Files are loaded after the default <Steam>/config/lua folder.
-# The default folder is always loaded last so user files take priority.
 [lua]
-paths = []
+# Additional Lua directories to load (optional)
+# paths = ["D:/my-steam-config/stplug-in"]
 
-[inject]
-# Optional library injection into game processes.
-# The injected library must match the target process architecture.
+[injects]
+# Competitive games strictly protected from DLL injection
+exclude_appids = [
+    730,      # Counter-Strike 2 (VAC)
+    570,      # Dota 2 (VAC)
+    1172470,  # Apex Legends (EAC)
+    578080,   # PUBG: BATTLEGROUNDS (BattlEye)
+]
+
+# [[inject]]
+# path = "OnlineFix.dll"
+# all_games = false
+# when_cmdline = "-onlinefix"
+# when_appids = [1361510]
+
+[cloud]
 enabled = false
-# library_x64 = "OpenSteamTool.GameHook.x64.dll"
-# library_x86 = "OpenSteamTool.GameHook.x86.dll"
+# library = "cloud_redirect.dll"
 
-# Optional metadata mirror. See "Steam version compatibility" below.
 [remote]
-# url_template = "https://your.server/{channel}/{component}/{sha256}.toml"
+order = "gh-proxy-first" # "gh-proxy-first" or "github-first"
 ```
 
-### Manifest via Lua
+> **Backwards Compatibility**: If `steamdaddy.toml` is not present, SteamDaddy automatically checks for `opensteamtool.toml` as a seamless fallback.
 
-Two manifest code functions are supported:
+---
 
-#### `fetch_manifest_code(gid)`
+## Steam Launch Options Reference
 
-Basic function that receives only the manifest GID.
+| Launch Option | Description |
+|---|---|
+| `-onlinefix` | Enables AppID 480 (Spacewar) multiplayer matchmaking with AppID and save protection. |
+| `-p2pflip` | Used alongside `-onlinefix` for rare titles requiring exact 480 certificate match in P2P handshakes. |
+| `-dauth2` | Enables Scheme 2 multi-stage adaptive ticket lease extension for strict Denuvo titles. |
+| `-d+` / `-lua` | Run on a genuine owning account to auto-generate `<AppId>.lua` and lock manifests. |
+| `-forcedenuvo` | Forces SteamDaddy to treat the target title as Denuvo-protected. |
+| `-nodenuvo` | Bypasses Denuvo ticket handling entirely for the target title. |
 
-#### `fetch_manifest_code_ex(app_id, depot_id, gid)` *(recommended)*
+---
 
-Extended function that receives `app_id`, `depot_id`, and `gid`. Allows constructing API endpoints that require app identification.
+## Lua API Reference
 
-The C++ runtime provides two Lua helpers:
+Lua unlock scripts are placed in `<Steam>\config\stplug-in\*.lua`.
 
-| Function | Signature | Returns |
-|----------|-----------|---------|
-| `http_get`  | `http_get(url [, headers])`       | `body, status_code` |
-| `http_post` | `http_post(url, body [, headers])` | `body, status_code` |
+```lua
+-- Game & DLC unlocking
+addappid(1361510)                                                      -- Unlock game
+addappid(1361511, 0, "5954562e7f5260400040a818bc29b60b335bb690...")   -- Unlock depot with decryption key
+addtoken(1361510, "2764735786934684318")                               -- Add PICS access token
 
-`headers` is an optional table: `{["Key"]="Value", ...}`.
+-- Manifest locking & updates
+setManifestid(1361511, "5656605350306673283")                         -- Pin depot manifest
+setManifestid(1361511, "5656605350306673283", 12345678)               -- Pin depot manifest with size
 
-### Steam version compatibility
+-- Ticket and credentials
+setAppTicket(1361510, "0100000000000000...")                           -- Set explicit AppTicket (hex)
+setETicket(1361510, "0100000000000000...")                             -- Set explicit ETicket (hex)
+setlegacycdkey(1361510, "AAAAA-BBBBB-CCCCC-DDDDD")                     -- Set legacy 3rd-party CD Key (Ubisoft/EA/Rockstar)
+pinapp(228980)                                                         -- Pin preferred donor app for tickets
 
-OpenSteamTool no longer ships byte-pattern signatures inside the DLL. Instead, on each launch it computes the SHA-256 of `steamclient64.dll` and `steamui.dll` on disk and looks up a matching pattern file from the upstream tracker at [`OpenSteam001/steam-monitor`](https://github.com/OpenSteam001/steam-monitor) (`pattern` branch).
+-- Denuvo helpers
+dauth2(1361510)                                                        -- Enable Scheme 2 adaptive lease
+forcedenuvo(1361510)                                                   -- Force Denuvo treatment
+nodenuvo(1361510)                                                      -- Bypass Denuvo handling
 
-Lookup order (every launch):
-
-1. **GitHub raw** — `https://raw.githubusercontent.com/OpenSteam001/steam-monitor/pattern/...`. Canonical source.
-2. **jsDelivr CDN** — automatic fallback if GitHub raw is unreachable (connection refused / timeout / 5xx). No configuration required. Useful in regions where `raw.githubusercontent.com` is blocked but jsDelivr is reachable (e.g. mainland China).
-3. **Local cache** — `<Steam>\opensteamtool\pattern\<subdir>\<sha256>.toml`. Used **only** when remote is unreachable. The cache is overwritten after every successful remote fetch.
-
-Remote is consulted on every launch so users automatically pick up upstream re-publications (e.g. the bot adding a new signature, or fixing an existing one) without having to clear any cache.
-
-If a step returns **HTTP 404** the mirror loop stops immediately — all mirrors serve the same content, so a 404 means the upstream bot has not yet published a TOML for this Steam build. The code then falls back to the local cache if one exists; otherwise a one-shot popup appears with the unmatched DLL name, its SHA-256, the expected cache path, and the upstream URL. Only the hooks tied to that DLL are disabled — the rest of OpenSteamTool keeps working.
-
-You can also drop a pattern TOML into the cache directory manually if you know the layout for a given build; the file name must be `<sha256>.toml`. The cache fallback will pick it up the next time remote is unreachable.
-
-> A short outbound HTTPS request is performed at every launch (one per DLL: `steamclient64.dll`, `steamui.dll`). The downloaded bodies are tiny (~10 KB each) and the work runs on a worker thread, so it never blocks Steam's loader.
-
-#### Using a different mirror
-
-For most users, the built-in **GitHub -> jsDelivr** fallback is enough. To use a private mirror or intranet server, configure a full URL template. A custom mirror replaces the built-in remote sources; local cache fallback remains available.
-
-The template must include `{channel}`, `{component}`, and `{sha256}`. Channels currently used are `pattern` and `ipc`.
-
-```toml
-[remote]
-url_template = "https://your.server/{channel}/{component}/{sha256}.toml"
-# url_template = "https://fast.jsdelivr.net/gh/OpenSteam001/steam-monitor@{channel}/{component}/{sha256}.toml"
+-- Stats and mapping
+setStat(1361510, "76561197960287930")                                  -- Achievement source SteamID
+addprocess(1361510, "CustomGame.exe")                                  -- Map custom executable to AppID
 ```
 
-### Debug logging
+---
 
-Debug builds write per-module log files under `<Steam>/opensteamtool/`:
+## Building from Source
 
-| File | Source | Content |
-|------|--------|---------|
-| `main.log`          | General | Init, config loading, Lua parsing, utilities |
-| `ipc.log`           | `LOG_IPC_*` | IPC commands, InterfaceCall dispatch, spoofing |
-| `netpacket.log`     | `LOG_NETPACKET_*` | Network packet send/recv, eMsg dispatch |
-| `manifest.log`      | `LOG_MANIFEST_*` | Manifest download, `fetch_manifest_code`, manifest binding |
-| `decryptionkey.log` | `LOG_DECRYPTIONKEY_*` | Depot decryption key injection |
-| `keyvalue.log`      | `LOG_KEYVALUE_*` | KeyValues patching (manifest binding) |
-| `misc.log`          | `LOG_MISC_*` | Engine pointer capture, AppId hints |
-| `achievement.log`   | `LOG_ACHIEVEMENT_*` | UserStats requests/responses, steamid spoofing |
-| `pics.log`          | `LOG_PICS_*` | PICS access token injection |
-| `package.log`       | `LOG_PACKAGE_*` | Package injection, FileWatcher events |
-| `onlinefix.log`     | `LOG_ONLINEFIX_*` | Online fix (480 AppId spoofing) |
-| `richpresence.log`  | `LOG_RICHPRESENCE_*` | Rich Presence packet construction and injection |
-| `steamui.log`       | `LOG_STEAMUI_*` | SteamUI hook diagnostics |
-| `pipe.log`          | `LOG_PIPE_*` | Pipe handshakes, process inspection, Denuvo authorization, library injection |
-| `platform.log`      | `LOG_PLATFORM_*` | Platform helper diagnostics, including remote-process operations |
+### Prerequisites
+* Windows 10/11 x64
+* CMake 3.20 or newer
+* Visual Studio 2022 / 2026 with MSVC C++ toolchain
 
-The log level is controlled by `[log] level` in `opensteamtool.toml`.
+### Build Commands
 
-## Build
-
-### Requirements
-- Windows 10/11
-- CMake 3.20+
-- Visual Studio 2022 with MSVC (x64 toolchain)
-
-### Runtime requirements
-- Outbound HTTPS access to `raw.githubusercontent.com` on first launch after a Steam update (see [Steam version compatibility](#steam-version-compatibility)). Cached afterwards.
-
-### Quick build
 ```powershell
-build.bat
+# 1. Configure the 64-bit build directory
+cmake -S src -B build -A x64
+
+# 2. Compile the core DLLs in Release mode
+cmake --build build --config Release --target SteamDaddy version dwmapi
+
+# 3. (Optional) Build the ticket extraction CLI tool
+cmake --build build --config Release --target extract_tickets
 ```
 
-### Output
-- Debug: `build/Debug/OpenSteamTool.dll`, `build/Debug/dwmapi.dll`, `build/Debug/xinput1_4.dll`
-- Release: `build/Release/OpenSteamTool.dll`, `build/Release/dwmapi.dll`, `build/Release/xinput1_4.dll`
+### Build Artifacts (`build\Release\`)
+* **`SteamDaddy.dll`**: The primary interception payload injected into Steam.
+* **`version.dll`**: Recommended Windows Version proxy loader for modern Steam.
+* **`dwmapi.dll`**: Alternative DWM sideload proxy containing `kEcosystemSignature = "SteamDaddy"`.
+* **`extract_tickets.exe`**: Ticket extraction and offline license generator (`build\tools\Release\`).
 
-## Disclaimer
-This project is provided for research and educational purposes only. You are responsible for complying with local laws, platform terms of service, and software licenses.
+---
+
+## Credits & Upstream
+* [Contrary7/SteamDaddy-Backup](https://github.com/Contrary7/SteamDaddy-Backup) — Main SteamDaddy Application & Ecosystem
+* [Contrary7/SteamDaddy-Dlls](https://github.com/Contrary7/SteamDaddy-Dlls) — Project Repository
+* [OpenSteam001/OpenSteamTool](https://github.com/OpenSteam001/OpenSteamTool) — Upstream Foundation
+* [huanyuejue/OpenSteamTool](https://github.com/huanyuejue/OpenSteamTool) — Upstream Provider & Manifest Optimizations
+* [mmxlyo/OpenSteamTool](https://github.com/mmxlyo/OpenSteamTool) — Denuvo Scheme 2 & Tooling Upstream
+* [Selectively11/CloudRedirect](https://github.com/Selectively11/CloudRedirect) — Cloud Redirection Subsystem
+* [microsoft/Detours](https://github.com/microsoft/Detours) — Binary Hooking Engine
+* [marzer/tomlplusplus](https://github.com/marzer/tomlplusplus) — TOML Parser

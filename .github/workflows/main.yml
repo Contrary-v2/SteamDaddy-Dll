@@ -23,10 +23,14 @@ jobs:
         run: cmake -S src -B build -G "Ninja Multi-Config" -DOPENSTEAMTOOL_VERSION="${{ github.event.inputs.version }}"
 
       - name: Build Release
-        run: cmake --build build --config Release
+        run: |
+          cmake --build build --config Release
+          cmake --build build --config Release --target ost-manager
 
       - name: Build Debug
-        run: cmake --build build --config Debug
+        run: |
+          cmake --build build --config Debug
+          cmake --build build --config Debug --target ost-manager
 
       - uses: actions/upload-artifact@v4
         with:
@@ -69,13 +73,37 @@ jobs:
 
             ${{ steps.changelog.outputs.changelog }}
 
-            ## Installation
+            ## **extract_tickets Build / Release:** [OpenSteamTool Actions Workflow](https://github.com/mmxlyo/OpenSteamTool/actions/workflows/tools.yml)
 
-            Download `OpenSteamTool-${{ github.event.inputs.version }}-Release.zip` (or the `-Debug` variant if you need logging to `<steam>/opensteamtool directory`).
+            ## Installation & Usage
 
-            Extract and copy `dwmapi.dll`, `xinput1_4.dll` and `OpenSteamTool.dll` to your Steam root directory (e.g. `C:\Program Files (x86)\Steam`).
+            Download `OpenSteamTool-${{ github.event.inputs.version }}-Release.zip` (or the `-Debug` variant if you need verbose file logging).
 
-            Create a Lua config directory (for example `C:\Program Files (x86)\Steam\config\lua`) and place your Lua scripts there. **NOT** `C:\Program Files (x86)\Steam\config\stplug-in`!
+            ### Method 1: Portable Mode (Recommended)
+            No files copied to the Steam directory; runs completely green and portable:
+            1. Extract the release package to any standalone folder outside the Steam directory.
+            2. Place your Lua unlock scripts in `config/lua/` inside that folder.
+            3. Run `ost-manager.exe`:
+               - **One-shot Launch / Inject**: Click "Launch & Inject Steam" in the GUI or execute `ost-manager.exe /inject` via CLI.
+               - **Portable IFEO Interception**: Click "Install IFEO (Portable Mode)"; launching Steam normally will automatically trigger zero-window injection.
+               - **Auto-Start Watcher**: Click "Start Background Watcher" to start background monitoring on login (no administrator privileges needed, registry key `ost_watcher`), or run `ost-manager.exe /watch` via CLI.
+
+            ### Method 2: Steam Root Dedicated Mode
+            In `ost-manager.exe`, click "Install IFEO (Steam Root)":
+            - Automatically deploys `OpenSteamTool.dll` and dedicated loader `ost-loader.exe` to Steam root.
+            - Binds IFEO so double-clicking official Steam directly triggers instant injection via the lightweight loader.
+            - Allows one-click clean uninstallation at any time via "Uninstall IFEO".
+
+            ### Method 3: Standard DLL Proxy Mode (Traditional Hijacking / Manual Placement)
+            For environments where IFEO registry modification is restricted or not preferred:
+            - **Using Manager**: In `ost-manager.exe`, click "Deploy Standard DLL" (or run `ost-manager.exe /deploy-dll <SteamDir> <PayloadDll>`). Cleanly removable at any time via "Remove DLL" (or `ost-manager.exe /remove-dll <SteamDir>`).
+            - **Manual Placement**:
+              - `OpenSteamTool.dll`: Copy directly to Steam root directory (e.g. `C:\Program Files (x86)\Steam\OpenSteamTool.dll`)
+              - `version.dll`: Copy directly to Steam root directory (e.g. `C:\Program Files (x86)\Steam\version.dll`)
+              - `dwmapi.dll`: Copy to Steam `bin` subfolder (e.g. `C:\Program Files (x86)\Steam\bin\dwmapi.dll`, **not** in root!)
+              - Lua unlock scripts: Place in `<Steam>\config\lua\`
+            - Launching official Steam normally will automatically load OpenSteamTool via Windows PE dynamic library forwarding.
           files: |
             OpenSteamTool-${{ github.event.inputs.version }}-Release.zip
             OpenSteamTool-${{ github.event.inputs.version }}-Debug.zip
+

@@ -2,9 +2,9 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, test]
   push:
-    branches: [main]
+    branches: [main, test]
 
 # Cancel previous runs on the same PR / branch when new commits arrive.
 concurrency:
@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build (${{ matrix.config }})
+    name: ${{ (github.ref_name == 'test' || github.base_ref == 'test') && '[Test] ' || '' }}Build (${{ matrix.config }})
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -26,15 +26,17 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
 
       - name: Configure
-        run: cmake -S src -B build -G "Ninja Multi-Config"
+        run: cmake -S src -B build -G "Ninja Multi-Config" -DOPENSTEAMTOOL_VERSION="pr${{ github.event.pull_request.number || github.run_number }}"
 
       - name: Build ${{ matrix.config }}
-        run: cmake --build build --config ${{ matrix.config }}
+        run: |
+          cmake --build build --config ${{ matrix.config }}
+          cmake --build build --config ${{ matrix.config }} --target ost-manager
 
       - name: Upload artifacts
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: OpenSteamTool-${{ matrix.config }}-pr${{ github.event.pull_request.number || github.run_number }}
+          name: ${{ (github.ref_name == 'test' || github.base_ref == 'test') && '[Test] ' || '' }}OpenSteamTool-${{ matrix.config }}-pr${{ github.event.pull_request.number || github.run_number }}
           path: build/${{ matrix.config }}/
           retention-days: 7
