@@ -1,4 +1,5 @@
 #include "dllmain.h"
+#include "OSTPlatform/include/Encoding.h"
 #include "OSTPlatform/include/Http.h"
 #include "OSTPlatform/include/Numbers.h"
 #include "Utils/Config/LuaConfig.h"
@@ -13,11 +14,13 @@
 #include <lua.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -27,29 +30,56 @@ extern "C" {
 }
 
 namespace LuaConfig{
+    static std::shared_mutex g_configSharedMutex;
+    static std::recursive_mutex g_luaStateMutex;
     static lua_State* g_lua_state = nullptr;
-    static bool g_hasManifestCodeFunc = false;
-    static bool g_hasManifestCodeFuncEx = false;
-    std::unordered_map<AppId_t, std::string>DepotKeySet{};
-    std::unordered_map<AppId_t, uint64_t>AccessTokenSet{};
-    std::unordered_set<AppId_t> PinnedApps{};
-    std::unordered_map<uint64_t, ManifestOverride> ManifestOverrides{};
-    std::unordered_map<AppId_t, uint64_t> StatSteamIdSet{};
-    std::unordered_set<AppId_t> OwnedAppIdSet{};
+    static std::atomic<bool> g_hasManifestCodeFunc{false};
+    static std::atomic<bool> g_hasManifestCodeFuncEx{false};
+    static std::string g_manifestCodeFuncFile;
+    static std::string g_manifestCodeFuncExFile;
+    static std::unordered_map<AppId_t, std::string> DepotKeySet{};
+    static std::unordered_map<AppId_t, uint64_t> AccessTokenSet{};
+    static std::unordered_map<AppId_t, std::string> LegacyCDKeySet{};
+    static std::unordered_set<AppId_t> PinnedApps{};
+    static std::unordered_map<uint64_t, ManifestOverride> ManifestOverrides{};
+    static std::unordered_map<AppId_t, uint64_t> StatSteamIdSet{};
+    static std::unordered_set<AppId_t> OwnedAppIdSet{};
     // Process exe name (lowercase) → appid; populated by addprocess() in Lua config.
-    std::unordered_map<std::string, AppId_t> ProcessNameAppIdMap{};
+    static std::unordered_map<std::string, AppId_t> ProcessNameAppIdMap{};
     // App IDs that should bypass ProtectionScan and be treated as Denuvo games.
-    std::unordered_set<AppId_t> ForcedDenuvoSet{};
+    static std::unordered_set<AppId_t> ForcedDenuvoSet{};
+    static std::unordered_set<AppId_t> g_cmdLineForcedDenuvo{};
     // App IDs that should bypass ProtectionScan and be treated as non-Denuvo games.
-    std::unordered_set<AppId_t> NoDenuvoSet{};
+    static std::unordered_set<AppId_t> NoDenuvoSet{};
+    static std::unordered_set<AppId_t> g_cmdLineNoDenuvo{};
+    // App IDs that should use Scheme 2 (adaptive time-window lease) for Denuvo authorization.
+    static std::unordered_set<AppId_t> DAuth2Set{};
+    static std::unordered_set<AppId_t> g_cmdLineDAuth2{};
     // On-demand eticket mint endpoint, set via seteticketurl() in Lua config.
     // Empty = disabled (EticketClient falls back to credential-store ticket).
-    std::string EticketUrl{};
+    static std::string EticketUrl{};
 
     // Per-file tracking: which depots each .lua file contributed.
     static std::string g_currentFile;
     static std::unordered_map<std::string, std::unordered_set<AppId_t>> g_fileDepots;
+    static std::unordered_map<std::string, std::unordered_set<AppId_t>> g_fileAppTickets;
+    static std::unordered_map<AppId_t, uint32_t> g_appTicketRefCount;
+    static std::unordered_map<std::string, std::unordered_set<AppId_t>> g_fileETickets;
+    static std::unordered_map<AppId_t, uint32_t> g_eTicketRefCount;
     static std::unordered_map<std::string, std::unordered_map<uint64_t, ManifestOverride>> g_fileManifestOverrides;
+    static std::unordered_map<std::string, std::unordered_map<AppId_t, uint64_t>> g_fileTokens;
+    static std::unordered_map<std::string, std::unordered_map<AppId_t, std::string>> g_fileLegacyCDKeys;
+    static std::unordered_map<std::string, std::unordered_map<std::string, AppId_t>> g_fileProcesses;
+    static std::unordered_map<std::string, std::unordered_set<AppId_t>> g_fileForcedDenuvo;
+    static std::unordered_map<AppId_t, uint32_t> g_forcedDenuvoRefCount;
+    static std::unordered_map<std::string, std::unordered_set<AppId_t>> g_fileNoDenuvo;
+    static std::unordered_map<AppId_t, uint32_t> g_noDenuvoRefCount;
+    static std::unordered_map<std::string, std::unordered_set<AppId_t>> g_fileDAuth2;
+    static std::unordered_map<AppId_t, uint32_t> g_dauth2RefCount;
+    static std::unordered_map<std::string, std::unordered_set<AppId_t>> g_filePinnedApps;
+    static std::unordered_map<AppId_t, uint32_t> g_pinnedAppsRefCount;
+    static std::unordered_map<std::string, std::unordered_map<AppId_t, uint64_t>> g_fileStats;
+    static std::unordered_map<std::string, std::string> g_fileEticketUrl;
     static std::unordered_map<std::string, uint64_t> g_fileParseSequence;
     static uint64_t g_nextFileParseSequence = 0;
     // Reference count: how many files provide each depot.
@@ -62,6 +92,24 @@ namespace LuaConfig{
     // Depot IDs removed by UnloadFile / added by ParseFile, consumed by NotifyLicenseChanged.
     static std::vector<AppId_t> g_pendingRemovals;
     static std::vector<AppId_t> g_pendingAdditions;
+
+    // RCU non-blocking snapshot for thread-safe zero-lock queries from UI thread
+    static std::atomic<std::shared_ptr<const std::vector<AppId_t>>> s_configuredAppIdsSnapshot{
+        std::make_shared<const std::vector<AppId_t>>()
+    };
+
+    static void RebuildConfiguredAppIdsSnapshotLocked() {
+        std::unordered_set<AppId_t> appIds;
+        for (const auto& [filePath, depots] : g_fileDepots) {
+            for (AppId_t id : depots) {
+                appIds.insert(id);
+            }
+        }
+        std::vector<AppId_t> vec(appIds.begin(), appIds.end());
+        std::sort(vec.begin(), vec.end());
+        s_configuredAppIdsSnapshot.store(
+            std::make_shared<const std::vector<AppId_t>>(std::move(vec)));
+    }
     constexpr uint64_t kDefaultStatSteamId = 76561198028121353ULL;
     static std::recursive_mutex g_manifestSyncMutex;
 
@@ -78,6 +126,21 @@ namespace LuaConfig{
 
     static uint8 ParseHexByte(std::string_view text) {
         return OSTPlatform::Numbers::ParseHexUInt8(text).value_or(0);
+    }
+
+    static std::vector<uint8_t> ParseHexStringToBytes(const char* hex, size_t hexLen) {
+        std::vector<uint8_t> binary;
+        if (!hex || hexLen == 0) return binary;
+        binary.reserve((hexLen + 1) / 2);
+        for (size_t i = 0; i < hexLen; i += 2) {
+            char byteStr[3] = {
+                hex[i],
+                i + 1 < hexLen ? hex[i + 1] : '0',
+                '\0'
+            };
+            binary.push_back(ParseHexByte(byteStr));
+        }
+        return binary;
     }
 
     static void SetActiveManifestOverride(uint64_t depotId, const ManifestOverride& override) {
@@ -112,6 +175,101 @@ namespace LuaConfig{
         }
     }
 
+    static void RebuildAccessToken(AppId_t appId) {
+        const uint64_t* best = nullptr;
+        uint64_t bestSeq = 0;
+
+        for (const auto& [file, tokens] : g_fileTokens) {
+            auto it = tokens.find(appId);
+            if (it == tokens.end()) continue;
+
+            auto seqIt = g_fileParseSequence.find(file);
+            if (seqIt == g_fileParseSequence.end()) continue;
+
+            if (!best || seqIt->second > bestSeq) {
+                best = &it->second;
+                bestSeq = seqIt->second;
+            }
+        }
+
+        if (best) {
+            AccessTokenSet[appId] = *best;
+        } else {
+            AccessTokenSet.erase(appId);
+        }
+    }
+
+    static void RebuildProcess(const std::string& procName) {
+        const AppId_t* best = nullptr;
+        uint64_t bestSeq = 0;
+
+        for (const auto& [file, procs] : g_fileProcesses) {
+            auto it = procs.find(procName);
+            if (it == procs.end()) continue;
+
+            auto seqIt = g_fileParseSequence.find(file);
+            if (seqIt == g_fileParseSequence.end()) continue;
+
+            if (!best || seqIt->second > bestSeq) {
+                best = &it->second;
+                bestSeq = seqIt->second;
+            }
+        }
+
+        if (best) {
+            ProcessNameAppIdMap[procName] = *best;
+        } else {
+            ProcessNameAppIdMap.erase(procName);
+        }
+    }
+
+    static void RebuildStatSteamId(AppId_t appId) {
+        const uint64_t* best = nullptr;
+        uint64_t bestSeq = 0;
+
+        for (const auto& [file, stats] : g_fileStats) {
+            auto it = stats.find(appId);
+            if (it == stats.end()) continue;
+
+            auto seqIt = g_fileParseSequence.find(file);
+            if (seqIt == g_fileParseSequence.end()) continue;
+
+            if (!best || seqIt->second > bestSeq) {
+                best = &it->second;
+                bestSeq = seqIt->second;
+            }
+        }
+
+        if (best) {
+            StatSteamIdSet[appId] = *best;
+        } else {
+            StatSteamIdSet.erase(appId);
+        }
+    }
+
+    static void RebuildEticketUrl() {
+        const std::string* best = nullptr;
+        uint64_t bestSeq = 0;
+
+        for (const auto& [file, url] : g_fileEticketUrl) {
+            if (url.empty()) continue;
+
+            auto seqIt = g_fileParseSequence.find(file);
+            if (seqIt == g_fileParseSequence.end()) continue;
+
+            if (!best || seqIt->second > bestSeq) {
+                best = &url;
+                bestSeq = seqIt->second;
+            }
+        }
+
+        if (best) {
+            EticketUrl = *best;
+        } else {
+            EticketUrl.clear();
+        }
+    }
+
     // ── Lua HTTP helpers ──────────────────────────────────────────
     //   http_get(url [, headers]) → body, status_code
     //     headers: optional table, e.g. {["Accept"]="application/json"}
@@ -127,10 +285,12 @@ namespace LuaConfig{
         if (idx < 1 || !lua_istable(L, idx)) return headers;
         lua_pushnil(L);
         while (lua_next(L, idx)) {
-            std::string key(lua_tostring(L, -2));
-            std::string val(lua_tostring(L, -1));
-            headers += std::wstring(key.begin(), key.end())
-                    + L": " + std::wstring(val.begin(), val.end()) + L"\r\n";
+            const char* kStr = lua_tostring(L, -2);
+            const char* vStr = lua_tostring(L, -1);
+            if (kStr && vStr) {
+                headers += OSTPlatform::Encoding::Utf8ToWide(kStr)
+                        + L": " + OSTPlatform::Encoding::Utf8ToWide(vStr) + L"\r\n";
+            }
             lua_pop(L, 1);
         }
         return headers;
@@ -201,30 +361,30 @@ namespace LuaConfig{
 
     // ── Lua: addappid / addtoken / pinApp / setManifestid ────────
     static int lua_addappid(lua_State* L) {
-        // addappid(integer, integer, string)
+        // addappid(integer [, integer, string] or [integer, string])
         int argc = lua_gettop(L);
-        // Validate argument count and required argument types.
-        if (argc == 0) {
-            return luaL_error(L, "");
-        }
-        if (!lua_isinteger(L, 1)) {
-            return luaL_error(L, "");
+        if (argc == 0 || !lua_isinteger(L, 1)) {
+            return luaL_error(L, "addappid requires (appid: integer [, type: integer, key: string])");
         }
 
-        // Read the first argument as app/depot id.
         lua_Integer value = lua_tointeger(L, 1);
-        // Ensure the value fits into uint32_t range.
         if (value < 0 || value > UINT32_MAX)
-            return luaL_error(L, "");
-        AppId_t DepotId = (uint32_t)value;
-        // Read the optional third argument as a key.
+            return luaL_error(L, "addappid: appid out of range");
+
+        if (argc > 2 && !lua_isstring(L, 3)) {
+            return luaL_error(L, "addappid: key must be string");
+        }
+
+        AppId_t DepotId = static_cast<uint32_t>(value);
         std::string Key = "";
         if (argc > 2) {
-            if (!lua_isstring(L, 3))
-                return luaL_error(L, "");
             const char* key = lua_tostring(L, 3);
-            // Keep only keys with exactly 64 characters.
-            if (strlen(key) == 64) {
+            if (key && strlen(key) == 64) {
+                Key = std::string(key);
+            }
+        } else if (argc == 2 && lua_isstring(L, 2)) {
+            const char* key = lua_tostring(L, 2);
+            if (key && strlen(key) == 64) {
                 Key = std::string(key);
             }
         }
@@ -278,7 +438,12 @@ namespace LuaConfig{
             if (!ParseUInt64Decimal(token, &parsedToken)) {
                 return luaL_error(L, "");
             }
-            AccessTokenSet[AppId] = parsedToken;
+            if (!g_currentFile.empty()) {
+                g_fileTokens[g_currentFile][AppId] = parsedToken;
+                RebuildAccessToken(AppId);
+            } else {
+                AccessTokenSet[AppId] = parsedToken;
+            }
         }
 
         return 0;
@@ -297,7 +462,13 @@ namespace LuaConfig{
         std::string name(lua_tostring(L, 2));
         for (char& ch : name)
             ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-        ProcessNameAppIdMap[name] = static_cast<AppId_t>(value);
+        AppId_t appId = static_cast<AppId_t>(value);
+        if (!g_currentFile.empty()) {
+            g_fileProcesses[g_currentFile][name] = appId;
+            RebuildProcess(name);
+        } else {
+            ProcessNameAppIdMap[name] = appId;
+        }
         return 0;
     }
 
@@ -308,7 +479,16 @@ namespace LuaConfig{
         lua_Integer value = lua_tointeger(L, 1);
         if (value <= 0 || value > static_cast<lua_Integer>(UINT32_MAX))
             return luaL_error(L, "forcedenuvo: appid out of range");
-        ForcedDenuvoSet.insert(static_cast<AppId_t>(value));
+        AppId_t appId = static_cast<AppId_t>(value);
+        if (!g_currentFile.empty()) {
+            if (g_fileForcedDenuvo[g_currentFile].insert(appId).second) {
+                if (++g_forcedDenuvoRefCount[appId] == 1) {
+                    ForcedDenuvoSet.insert(appId);
+                }
+            }
+        } else {
+            ForcedDenuvoSet.insert(appId);
+        }
         return 0;
     }
 
@@ -319,7 +499,36 @@ namespace LuaConfig{
         lua_Integer value = lua_tointeger(L, 1);
         if (value <= 0 || value > static_cast<lua_Integer>(UINT32_MAX))
             return luaL_error(L, "nodenuvo: appid out of range");
-        NoDenuvoSet.insert(static_cast<AppId_t>(value));
+        AppId_t appId = static_cast<AppId_t>(value);
+        if (!g_currentFile.empty()) {
+            if (g_fileNoDenuvo[g_currentFile].insert(appId).second) {
+                if (++g_noDenuvoRefCount[appId] == 1) {
+                    NoDenuvoSet.insert(appId);
+                }
+            }
+        } else {
+            NoDenuvoSet.insert(appId);
+        }
+        return 0;
+    }
+
+    static int lua_dauth2(lua_State* L) {
+        // dauth2(appid) — activate Scheme 2 (adaptive time-window lease) for Denuvo authorization.
+        if (lua_gettop(L) < 1 || !lua_isinteger(L, 1))
+            return luaL_error(L, "dauth2 requires (appid: integer)");
+        lua_Integer value = lua_tointeger(L, 1);
+        if (value <= 0 || value > static_cast<lua_Integer>(UINT32_MAX))
+            return luaL_error(L, "dauth2: appid out of range");
+        AppId_t appId = static_cast<AppId_t>(value);
+        if (!g_currentFile.empty()) {
+            if (g_fileDAuth2[g_currentFile].insert(appId).second) {
+                if (++g_dauth2RefCount[appId] == 1) {
+                    DAuth2Set.insert(appId);
+                }
+            }
+        } else {
+            DAuth2Set.insert(appId);
+        }
         return 0;
     }
 
@@ -329,7 +538,39 @@ namespace LuaConfig{
         // strict Denuvo titles. Set to "" (or omit the call) to disable.
         if (lua_gettop(L) < 1 || !lua_isstring(L, 1))
             return luaL_error(L, "seteticketurl requires (url: string)");
-        EticketUrl = std::string(lua_tostring(L, 1));
+        std::string url(lua_tostring(L, 1));
+        if (!g_currentFile.empty()) {
+            g_fileEticketUrl[g_currentFile] = url;
+            RebuildEticketUrl();
+        } else {
+            EticketUrl = url;
+        }
+        return 0;
+    }
+
+    static int lua_setlegacycdkey(lua_State* L) {
+        // setlegacycdkey(integer appid, string key)
+        int argc = lua_gettop(L);
+        if (argc < 2) {
+            return luaL_error(L, "setlegacycdkey: requires 2 arguments (appid, key)");
+        }
+        if (!lua_isinteger(L, 1)) {
+            return luaL_error(L, "setlegacycdkey: argument 1 must be integer appid");
+        }
+        lua_Integer value = lua_tointeger(L, 1);
+        if (value < 0 || value > UINT32_MAX)
+            return luaL_error(L, "setlegacycdkey: appid out of range");
+        AppId_t AppId = static_cast<AppId_t>(value);
+        if (!lua_isstring(L, 2))
+            return luaL_error(L, "setlegacycdkey: argument 2 must be string CD key");
+
+        const char* keyStr = lua_tostring(L, 2);
+        std::string key = keyStr ? keyStr : "";
+        std::unique_lock lock(g_configSharedMutex);
+        LegacyCDKeySet[AppId] = key;
+        if (!g_currentFile.empty()) {
+            g_fileLegacyCDKeys[g_currentFile][AppId] = key;
+        }
         return 0;
     }
 
@@ -351,7 +592,15 @@ namespace LuaConfig{
             return luaL_error(L, "");
         AppId_t AppId = (uint32_t)value;
 
-        PinnedApps.insert(AppId);
+        if (!g_currentFile.empty()) {
+            if (g_filePinnedApps[g_currentFile].insert(AppId).second) {
+                if (++g_pinnedAppsRefCount[AppId] == 1) {
+                    PinnedApps.insert(AppId);
+                }
+            }
+        } else {
+            PinnedApps.insert(AppId);
+        }
 
         return 0;
     }
@@ -407,20 +656,16 @@ namespace LuaConfig{
 
         size_t hexLen;
         const char* hex = lua_tolstring(L, 2, &hexLen);
-
-        std::vector<uint8_t> binary;
-        binary.reserve((hexLen + 1) / 2);
-        for (size_t i = 0; i < hexLen; i += 2) {
-            char byteStr[3] = {
-                hex[i],
-                i + 1 < hexLen ? hex[i + 1] : '0',
-                '\0'
-            };
-            binary.push_back(ParseHexByte(byteStr));
-        }
+        const auto binary = ParseHexStringToBytes(hex, hexLen);
 
         if (!AppTicket::WriteAppOwnershipTicket(appId, binary))
             return luaL_error(L, "setAppTicket: failed to write credential store");
+
+        if (!g_currentFile.empty()) {
+            if (g_fileAppTickets[g_currentFile].insert(appId).second) {
+                ++g_appTicketRefCount[appId];
+            }
+        }
 
         return 0;
     }
@@ -441,20 +686,16 @@ namespace LuaConfig{
 
         size_t hexLen;
         const char* hex = lua_tolstring(L, 2, &hexLen);
-
-        std::vector<uint8_t> binary;
-        binary.reserve((hexLen + 1) / 2);
-        for (size_t i = 0; i < hexLen; i += 2) {
-            char byteStr[3] = {
-                hex[i],
-                i + 1 < hexLen ? hex[i + 1] : '0',
-                '\0'
-            };
-            binary.push_back(ParseHexByte(byteStr));
-        }
+        const auto binary = ParseHexStringToBytes(hex, hexLen);
 
         if (!AppTicket::WriteEncryptedTicket(appId, binary))
             return luaL_error(L, "setETicket: failed to write credential store");
+
+        if (!g_currentFile.empty()) {
+            if (g_fileETickets[g_currentFile].insert(appId).second) {
+                ++g_eTicketRefCount[appId];
+            }
+        }
 
         return 0;
     }
@@ -481,12 +722,18 @@ namespace LuaConfig{
         if (!ParseUInt64Decimal(sidStr, &steamId))
             return luaL_error(L, "setStat: steamId must be all digits");
 
-        StatSteamIdSet[appId] = steamId;
+        if (!g_currentFile.empty()) {
+            g_fileStats[g_currentFile][appId] = steamId;
+            RebuildStatSteamId(appId);
+        } else {
+            StatSteamIdSet[appId] = steamId;
+        }
         return 0;
     }
 
     // ── init / cleanup ───────────────────────────────────────────
     static bool Initialize() {
+        std::lock_guard lock(g_luaStateMutex);
         if (g_lua_state)
             return true;
         g_lua_state = luaL_newstate();
@@ -518,6 +765,7 @@ namespace LuaConfig{
         // we don't need it?
         // register_func(g_lua_state, "pinapp", lua_pinApp);
         register_func(g_lua_state, "setmanifestid", lua_setManifestid);
+        register_func(g_lua_state, "dauth2", lua_dauth2);
         register_func(g_lua_state, "http_get", lua_http_get);
         register_func(g_lua_state, "http_post", lua_http_post);
         register_func(g_lua_state, "setappticket", lua_setAppticket);
@@ -526,52 +774,111 @@ namespace LuaConfig{
         return true;
     }
 
-    static void Cleanup() {
+    void Shutdown() {
+        std::lock_guard lock(g_luaStateMutex);
         if (g_lua_state) {
             lua_close(g_lua_state);
             g_lua_state = nullptr;
         }
         g_hasManifestCodeFunc = false;
+        g_hasManifestCodeFuncEx = false;
+        g_manifestCodeFuncFile.clear();
+        g_manifestCodeFuncExFile.clear();
     }
 
     // ── public query API ─────────────────────────────────────────
-    AppId_t GetAppIdForProcess(const std::string& imageName) {
+    AppId_t GetAppIdForProcess(std::string_view imageName) {
         std::string lower(imageName);
         for (char& ch : lower)
             ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        std::shared_lock lock(g_configSharedMutex);
         const auto it = ProcessNameAppIdMap.find(lower);
         return it != ProcessNameAppIdMap.end() ? it->second : k_uAppIdInvalid;
     }
 
     bool IsForcedDenuvo(AppId_t appId) {
-        return ForcedDenuvoSet.count(appId) > 0;
+        std::shared_lock lock(g_configSharedMutex);
+        return ForcedDenuvoSet.count(appId) > 0 || g_cmdLineForcedDenuvo.count(appId) > 0;
     }
 
-    bool IsNoDenuvo(AppId_t appId) {
-        return NoDenuvoSet.count(appId) > 0;
-    }
-
-    const std::string& GetEticketUrl() {
-        return EticketUrl;
-    }
-
-    bool HasDepot(AppId_t DepotId,bool excludeOwned) {
-        return DepotKeySet.count(DepotId) && (!excludeOwned || !IsOwned(DepotId));
-    }
-
-    bool IsOwned(AppId_t AppId) {
-        return OwnedAppIdSet.count(AppId);
-    }
-
-    void MarkOwned(AppId_t AppId) {
-        if(!OwnedAppIdSet.count(AppId)) {
-            LOG_PACKAGE_INFO("Marking app {} as owned", AppId);
-            OwnedAppIdSet.insert(AppId);
+    void SetCmdLineForcedDenuvo(AppId_t appId, bool active) {
+        if (appId == 0 || appId == k_uAppIdInvalid) return;
+        std::unique_lock lock(g_configSharedMutex);
+        if (active) {
+            g_cmdLineForcedDenuvo.insert(appId);
+        } else {
+            g_cmdLineForcedDenuvo.erase(appId);
         }
     }
 
+    bool IsNoDenuvo(AppId_t appId) {
+        std::shared_lock lock(g_configSharedMutex);
+        return NoDenuvoSet.count(appId) > 0 || g_cmdLineNoDenuvo.count(appId) > 0;
+    }
+
+    void SetCmdLineNoDenuvo(AppId_t appId, bool active) {
+        if (appId == 0 || appId == k_uAppIdInvalid) return;
+        std::unique_lock lock(g_configSharedMutex);
+        if (active) {
+            g_cmdLineNoDenuvo.insert(appId);
+        } else {
+            g_cmdLineNoDenuvo.erase(appId);
+        }
+    }
+
+    bool IsDAuth2(AppId_t appId) {
+        std::shared_lock lock(g_configSharedMutex);
+        return DAuth2Set.count(appId) > 0 || g_cmdLineDAuth2.count(appId) > 0;
+    }
+
+    void SetCmdLineDAuth2(AppId_t appId, bool active) {
+        if (appId == 0 || appId == k_uAppIdInvalid) return;
+        std::unique_lock lock(g_configSharedMutex);
+        if (active) {
+            g_cmdLineDAuth2.insert(appId);
+        } else {
+            g_cmdLineDAuth2.erase(appId);
+        }
+    }
+
+    std::string GetEticketUrl() {
+        std::shared_lock lock(g_configSharedMutex);
+        return EticketUrl;
+    }
+
+    bool HasDepot(AppId_t DepotId, bool excludeOwned) {
+        std::shared_lock lock(g_configSharedMutex);
+        return DepotKeySet.count(DepotId) && (!excludeOwned || !OwnedAppIdSet.count(DepotId));
+    }
+
+    bool IsOwned(AppId_t AppId) {
+        std::shared_lock lock(g_configSharedMutex);
+        return OwnedAppIdSet.count(AppId) > 0;
+    }
+
+    void MarkOwned(AppId_t AppId) {
+        std::unique_lock lock(g_configSharedMutex);
+        if (OwnedAppIdSet.insert(AppId).second) {
+            LOG_PACKAGE_INFO("Marking app {} as owned", AppId);
+        }
+    }
+
+    void UnmarkOwned(AppId_t AppId) {
+        std::unique_lock lock(g_configSharedMutex);
+        if (OwnedAppIdSet.erase(AppId) > 0) {
+            LOG_PACKAGE_INFO("Unmarking app {} as owned", AppId);
+        }
+    }
+
+    void ClearOwned() {
+        std::unique_lock lock(g_configSharedMutex);
+        OwnedAppIdSet.clear();
+    }
+
     std::vector<AppId_t> GetAllDepotIds() {
+        std::shared_lock lock(g_configSharedMutex);
         std::vector<AppId_t> DepotIds;
+        DepotIds.reserve(DepotKeySet.size());
         for (const auto& pair : DepotKeySet) {
             DepotIds.push_back(pair.first);
         }
@@ -579,55 +886,91 @@ namespace LuaConfig{
     }
 
     std::vector<uint8> GetDecryptionKey(AppId_t DepotId) {
-        std::vector<uint8> keyBytes;
-        if (DepotKeySet.count(DepotId)) {
-            const std::string& keyStr = DepotKeySet[DepotId];
-            // Convert hex string to byte vector.
-            for (size_t i = 0; i < keyStr.length(); i += 2) {
-                keyBytes.push_back(ParseHexByte(std::string_view(keyStr).substr(i, 2)));
+        std::string keyCopy;
+        {
+            std::shared_lock lock(g_configSharedMutex);
+            auto it = DepotKeySet.find(DepotId);
+            if (it != DepotKeySet.end()) {
+                keyCopy = it->second;
             }
         }
-        return keyBytes;
+        if (!keyCopy.empty()) {
+            return ParseHexStringToBytes(keyCopy.data(), keyCopy.size());
+        }
+        return {};
     }
 
     uint64_t GetAccessToken(AppId_t AppId) {
-        if (AccessTokenSet.count(AppId)) {
-            return AccessTokenSet[AppId];
-        }
-        return 0;
+        std::shared_lock lock(g_configSharedMutex);
+        auto it = AccessTokenSet.find(AppId);
+        return it != AccessTokenSet.end() ? it->second : 0;
+    }
+
+    std::optional<std::string> GetLegacyCDKey(AppId_t AppId) {
+        std::shared_lock lock(g_configSharedMutex);
+        auto it = LegacyCDKeySet.find(AppId);
+        if (it != LegacyCDKeySet.end())
+            return it->second;
+        return std::nullopt;
     }
 
     bool pinApp(AppId_t AppId) {
-        return PinnedApps.count(AppId);
+        std::shared_lock lock(g_configSharedMutex);
+        return PinnedApps.count(AppId) > 0;
+    }
+
+    void PrewarmStatSteamId(AppId_t AppId) {
+        if (AppId == k_uAppIdInvalid) return;
+        {
+            std::shared_lock lock(g_configSharedMutex);
+            if (StatSteamIdSet.contains(AppId))
+                return;
+        }
+        StatsClient::PrewarmStatSteamId(AppId);
     }
 
     uint64_t GetStatSteamId(AppId_t AppId) {
-        if (StatSteamIdSet.count(AppId))
-            return StatSteamIdSet[AppId];
+        {
+            std::shared_lock lock(g_configSharedMutex);
+            auto it = StatSteamIdSet.find(AppId);
+            if (it != StatSteamIdSet.end())
+                return it->second;
+        }
         uint64_t apiSteamId = 0;
-        if (StatsClient::FetchStatSteamId(AppId, &apiSteamId))
+        if (StatsClient::TryGetCachedStatSteamId(AppId, &apiSteamId))
             return apiSteamId;
         return kDefaultStatSteamId;
     }
 
     uint32_t GetPurchaseTime(AppId_t AppId) {
+        std::shared_lock lock(g_configSharedMutex);
         auto it = g_purchaseTime.find(AppId);
         return it != g_purchaseTime.end() ? it->second : 0;
     }
 
-    const std::unordered_map<uint64_t, ManifestOverride>& GetManifestOverrides() {
-      return ManifestOverrides;
+    std::unordered_map<uint64_t, ManifestOverride> GetManifestOverrides() {
+        std::shared_lock lock(g_configSharedMutex);
+        return ManifestOverrides;
     }
 
-    bool HasManifestCodeFunc() {
-        return g_hasManifestCodeFunc;
+    bool HasManifestCodeFunc() noexcept {
+        return g_hasManifestCodeFunc.load(std::memory_order_relaxed);
     }
 
     bool CallManifestFetchCode(uint64_t gid, uint64_t* outCode) {
-        if (!g_hasManifestCodeFunc || !g_lua_state)
+        if (!outCode || !g_hasManifestCodeFunc.load(std::memory_order_relaxed))
+            return false;
+
+        std::lock_guard lock(g_luaStateMutex);
+        if (!g_lua_state)
             return false;
 
         lua_getglobal(g_lua_state, "fetch_manifest_code");
+        if (!lua_isfunction(g_lua_state, -1)) {
+            lua_pop(g_lua_state, 1);
+            g_hasManifestCodeFunc.store(false, std::memory_order_relaxed);
+            return false;
+        }
         lua_pushinteger(g_lua_state, static_cast<lua_Integer>(gid));
 
         if (lua_pcall(g_lua_state, 1, 1, 0) != LUA_OK) {
@@ -670,15 +1013,24 @@ namespace LuaConfig{
         return true;
     }
 
-    bool HasManifestCodeFuncEx() {
-        return g_hasManifestCodeFuncEx;
+    bool HasManifestCodeFuncEx() noexcept {
+        return g_hasManifestCodeFuncEx.load(std::memory_order_relaxed);
     }
 
     bool CallManifestFetchCodeEx(uint64_t app_id, uint64_t depot_id, uint64_t gid, uint64_t* outCode) {
-        if (!g_hasManifestCodeFuncEx || !g_lua_state)
+        if (!outCode || !g_hasManifestCodeFuncEx.load(std::memory_order_relaxed))
+            return false;
+
+        std::lock_guard lock(g_luaStateMutex);
+        if (!g_lua_state)
             return false;
 
         lua_getglobal(g_lua_state, "fetch_manifest_code_ex");
+        if (!lua_isfunction(g_lua_state, -1)) {
+            lua_pop(g_lua_state, 1);
+            g_hasManifestCodeFuncEx.store(false, std::memory_order_relaxed);
+            return false;
+        }
         lua_pushinteger(g_lua_state, static_cast<lua_Integer>(app_id));
         lua_pushinteger(g_lua_state, static_cast<lua_Integer>(depot_id));
         lua_pushinteger(g_lua_state, static_cast<lua_Integer>(gid));
@@ -721,11 +1073,37 @@ namespace LuaConfig{
     }
 
     // ── per-file unload ────────────────────────────────────────
-    void UnloadFile(const std::string& rawFilePath) {
-        std::string filePath = std::filesystem::path(rawFilePath).lexically_normal().string();
+    // Design note: AppTicket and ETicket are handled purely in memory.
+    // - On file reload/re-parse (ParseFile) or unload: when ticket refcount reaches 0,
+    //   in-memory tickets are cleared immediately (commenting out a ticket removes it naturally).
+    // - On explicit file deletion (LuaFileWatcher delete event): `isPermanentRemoval` is true,
+    //   clearing all cached in-memory credentials once all referencing lua files and depots drop to 0.
+    static void UnloadFileLocked(const std::string& rawFilePath, bool isPermanentRemoval) {
+        std::string filePath = OSTPlatform::Encoding::PathToUtf8(
+            OSTPlatform::Encoding::PathFromUtf8(rawFilePath).lexically_normal());
         auto depotsIt = g_fileDepots.find(filePath);
         auto manifestIt = g_fileManifestOverrides.find(filePath);
-        if (depotsIt == g_fileDepots.end() && manifestIt == g_fileManifestOverrides.end()) return;
+        auto appTicketIt = g_fileAppTickets.find(filePath);
+        auto eTicketIt = g_fileETickets.find(filePath);
+        auto tokenIt = g_fileTokens.find(filePath);
+        auto procIt = g_fileProcesses.find(filePath);
+        auto forcedIt = g_fileForcedDenuvo.find(filePath);
+        auto noDenuvoIt = g_fileNoDenuvo.find(filePath);
+        auto dauth2It = g_fileDAuth2.find(filePath);
+        auto pinnedIt = g_filePinnedApps.find(filePath);
+        auto statIt = g_fileStats.find(filePath);
+        auto eticketUrlIt = g_fileEticketUrl.find(filePath);
+
+        if (depotsIt == g_fileDepots.end() && manifestIt == g_fileManifestOverrides.end() &&
+            appTicketIt == g_fileAppTickets.end() && eTicketIt == g_fileETickets.end() &&
+            tokenIt == g_fileTokens.end() &&
+            procIt == g_fileProcesses.end() && forcedIt == g_fileForcedDenuvo.end() &&
+            noDenuvoIt == g_fileNoDenuvo.end() && dauth2It == g_fileDAuth2.end() && pinnedIt == g_filePinnedApps.end() &&
+            statIt == g_fileStats.end() && eticketUrlIt == g_fileEticketUrl.end()) {
+            g_fileParseSequence.erase(filePath);
+            g_fileMtime.erase(filePath);
+            return;
+        }
 
         if (depotsIt != g_fileDepots.end()) {
             for (AppId_t id : depotsIt->second) {
@@ -735,11 +1113,46 @@ namespace LuaConfig{
                     DepotKeySet.erase(id);
                     g_purchaseTime.erase(id);
                     g_pendingRemovals.push_back(id);
+                    if (isPermanentRemoval && !g_appTicketRefCount.contains(id) && !g_eTicketRefCount.contains(id)) {
+                        AppTicket::ClearCachedTickets(id);
+                    }
                 }
             }
 
             LOG_PACKAGE_INFO("UnloadFile: removed {} depots from {}", depotsIt->second.size(), filePath);
             g_fileDepots.erase(depotsIt);
+        }
+
+        if (appTicketIt != g_fileAppTickets.end()) {
+            for (AppId_t id : appTicketIt->second) {
+                auto refIt = g_appTicketRefCount.find(id);
+                if (refIt != g_appTicketRefCount.end()) {
+                    if (--refIt->second == 0) {
+                        g_appTicketRefCount.erase(refIt);
+                        AppTicket::RemoveAppOwnershipTicket(id);
+                        if (isPermanentRemoval && !g_depotRefCount.contains(id) && !g_eTicketRefCount.contains(id)) {
+                            AppTicket::ClearCachedTickets(id);
+                        }
+                    }
+                }
+            }
+            g_fileAppTickets.erase(appTicketIt);
+        }
+
+        if (eTicketIt != g_fileETickets.end()) {
+            for (AppId_t id : eTicketIt->second) {
+                auto refIt = g_eTicketRefCount.find(id);
+                if (refIt != g_eTicketRefCount.end()) {
+                    if (--refIt->second == 0) {
+                        g_eTicketRefCount.erase(refIt);
+                        AppTicket::RemoveEncryptedTicket(id);
+                        if (isPermanentRemoval && !g_depotRefCount.contains(id) && !g_appTicketRefCount.contains(id)) {
+                            AppTicket::ClearCachedTickets(id);
+                        }
+                    }
+                }
+            }
+            g_fileETickets.erase(eTicketIt);
         }
 
         if (manifestIt != g_fileManifestOverrides.end()) {
@@ -757,17 +1170,144 @@ namespace LuaConfig{
             LOG_MANIFEST_INFO("UnloadFile: removed {} manifest override(s) from {}", affectedDepots.size(), filePath);
         }
 
+        if (tokenIt != g_fileTokens.end()) {
+            std::vector<AppId_t> affectedTokens;
+            affectedTokens.reserve(tokenIt->second.size());
+            for (const auto& [appId, _] : tokenIt->second) {
+                affectedTokens.push_back(appId);
+            }
+            g_fileTokens.erase(tokenIt);
+            for (AppId_t appId : affectedTokens) {
+                RebuildAccessToken(appId);
+            }
+        }
+
+        if (procIt != g_fileProcesses.end()) {
+            std::vector<std::string> affectedProcs;
+            affectedProcs.reserve(procIt->second.size());
+            for (const auto& [procName, _] : procIt->second) {
+                affectedProcs.push_back(procName);
+            }
+            g_fileProcesses.erase(procIt);
+            for (const auto& procName : affectedProcs) {
+                RebuildProcess(procName);
+            }
+        }
+
+        if (forcedIt != g_fileForcedDenuvo.end()) {
+            for (AppId_t appId : forcedIt->second) {
+                auto refIt = g_forcedDenuvoRefCount.find(appId);
+                if (refIt != g_forcedDenuvoRefCount.end()) {
+                    if (--refIt->second == 0) {
+                        g_forcedDenuvoRefCount.erase(refIt);
+                        ForcedDenuvoSet.erase(appId);
+                    }
+                }
+            }
+            g_fileForcedDenuvo.erase(forcedIt);
+        }
+
+        if (noDenuvoIt != g_fileNoDenuvo.end()) {
+            for (AppId_t appId : noDenuvoIt->second) {
+                auto refIt = g_noDenuvoRefCount.find(appId);
+                if (refIt != g_noDenuvoRefCount.end()) {
+                    if (--refIt->second == 0) {
+                        g_noDenuvoRefCount.erase(refIt);
+                        NoDenuvoSet.erase(appId);
+                    }
+                }
+            }
+            g_fileNoDenuvo.erase(noDenuvoIt);
+        }
+
+        if (dauth2It != g_fileDAuth2.end()) {
+            for (AppId_t appId : dauth2It->second) {
+                auto refIt = g_dauth2RefCount.find(appId);
+                if (refIt != g_dauth2RefCount.end()) {
+                    if (--refIt->second == 0) {
+                        g_dauth2RefCount.erase(refIt);
+                        DAuth2Set.erase(appId);
+                    }
+                }
+            }
+            g_fileDAuth2.erase(dauth2It);
+        }
+
+        if (pinnedIt != g_filePinnedApps.end()) {
+            for (AppId_t appId : pinnedIt->second) {
+                auto refIt = g_pinnedAppsRefCount.find(appId);
+                if (refIt != g_pinnedAppsRefCount.end()) {
+                    if (--refIt->second == 0) {
+                        g_pinnedAppsRefCount.erase(refIt);
+                        PinnedApps.erase(appId);
+                    }
+                }
+            }
+            g_filePinnedApps.erase(pinnedIt);
+        }
+
+        if (statIt != g_fileStats.end()) {
+            std::vector<AppId_t> affectedStats;
+            affectedStats.reserve(statIt->second.size());
+            for (const auto& [appId, _] : statIt->second) {
+                affectedStats.push_back(appId);
+            }
+            g_fileStats.erase(statIt);
+            for (AppId_t appId : affectedStats) {
+                RebuildStatSteamId(appId);
+            }
+        }
+
+        if (eticketUrlIt != g_fileEticketUrl.end()) {
+            g_fileEticketUrl.erase(eticketUrlIt);
+            RebuildEticketUrl();
+        }
+
+        if (!g_manifestCodeFuncFile.empty() && filePath == g_manifestCodeFuncFile) {
+            std::lock_guard luaLock(g_luaStateMutex);
+            if (g_lua_state) {
+                lua_pushnil(g_lua_state);
+                lua_setglobal(g_lua_state, "fetch_manifest_code");
+            }
+            g_hasManifestCodeFunc.store(false, std::memory_order_relaxed);
+            g_manifestCodeFuncFile.clear();
+        }
+
+        if (!g_manifestCodeFuncExFile.empty() && filePath == g_manifestCodeFuncExFile) {
+            std::lock_guard luaLock(g_luaStateMutex);
+            if (g_lua_state) {
+                lua_pushnil(g_lua_state);
+                lua_setglobal(g_lua_state, "fetch_manifest_code_ex");
+            }
+            g_hasManifestCodeFuncEx.store(false, std::memory_order_relaxed);
+            g_manifestCodeFuncExFile.clear();
+        }
+
         g_fileParseSequence.erase(filePath);
         g_fileMtime.erase(filePath);
     }
 
+    void UnloadFile(const std::string& rawFilePath, bool isPermanentRemoval, bool rebuildSnapshot) {
+        std::unique_lock lock(g_configSharedMutex);
+        UnloadFileLocked(rawFilePath, isPermanentRemoval);
+        if (rebuildSnapshot) {
+            RebuildConfiguredAppIdsSnapshotLocked();
+        }
+    }
+
     static bool StartsWithCaseInsensitive(std::string_view str, std::string_view prefix) {
-        if (str.size() < prefix.size()) return false;
-        return _strnicmp(str.data(), prefix.data(), prefix.size()) == 0;
+        if (prefix.empty()) return true;
+        if (str.empty()) return false;
+        std::wstring wideStr = OSTPlatform::Encoding::Utf8ToWide(str);
+        std::wstring widePrefix = OSTPlatform::Encoding::Utf8ToWide(prefix);
+        if (wideStr.size() < widePrefix.size()) return false;
+        return _wcsnicmp(wideStr.c_str(), widePrefix.c_str(), widePrefix.size()) == 0;
     }
 
     uint32_t UnloadDirectory(const std::string& rawDirPath) {
-        std::string dirPath = std::filesystem::path(rawDirPath).lexically_normal().string();
+        std::unique_lock lock(g_configSharedMutex);
+        std::string dirPath = OSTPlatform::Encoding::PathToUtf8(
+            OSTPlatform::Encoding::PathFromUtf8(rawDirPath).lexically_normal());
         if (dirPath.empty()) return 0;
         if (dirPath.back() != '\\' && dirPath.back() != '/') {
             dirPath += '\\';
@@ -784,6 +1324,56 @@ namespace LuaConfig{
                 toUnload.push_back(filePath);
             }
         }
+        for (const auto& [filePath, _] : g_fileAppTickets) {
+            if (StartsWithCaseInsensitive(filePath, dirPath)) {
+                toUnload.push_back(filePath);
+            }
+        }
+        for (const auto& [filePath, _] : g_fileETickets) {
+            if (StartsWithCaseInsensitive(filePath, dirPath)) {
+                toUnload.push_back(filePath);
+            }
+        }
+        for (const auto& [filePath, _] : g_fileTokens) {
+            if (StartsWithCaseInsensitive(filePath, dirPath)) {
+                toUnload.push_back(filePath);
+            }
+        }
+        for (const auto& [filePath, _] : g_fileProcesses) {
+            if (StartsWithCaseInsensitive(filePath, dirPath)) {
+                toUnload.push_back(filePath);
+            }
+        }
+        for (const auto& [filePath, _] : g_fileForcedDenuvo) {
+            if (StartsWithCaseInsensitive(filePath, dirPath)) {
+                toUnload.push_back(filePath);
+            }
+        }
+        for (const auto& [filePath, _] : g_fileNoDenuvo) {
+            if (StartsWithCaseInsensitive(filePath, dirPath)) {
+                toUnload.push_back(filePath);
+            }
+        }
+        for (const auto& [filePath, _] : g_fileDAuth2) {
+            if (StartsWithCaseInsensitive(filePath, dirPath)) {
+                toUnload.push_back(filePath);
+            }
+        }
+        for (const auto& [filePath, _] : g_filePinnedApps) {
+            if (StartsWithCaseInsensitive(filePath, dirPath)) {
+                toUnload.push_back(filePath);
+            }
+        }
+        for (const auto& [filePath, _] : g_fileStats) {
+            if (StartsWithCaseInsensitive(filePath, dirPath)) {
+                toUnload.push_back(filePath);
+            }
+        }
+        for (const auto& [filePath, _] : g_fileEticketUrl) {
+            if (StartsWithCaseInsensitive(filePath, dirPath)) {
+                toUnload.push_back(filePath);
+            }
+        }
         for (const auto& [filePath, _] : g_fileParseSequence) {
             if (StartsWithCaseInsensitive(filePath, dirPath)) {
                 toUnload.push_back(filePath);
@@ -795,18 +1385,21 @@ namespace LuaConfig{
 
         for (const auto& filePath : toUnload) {
             LOG_PACKAGE_INFO("UnloadDirectory: unloading file '{}' from removed dir '{}'", filePath, rawDirPath);
-            UnloadFile(filePath);
+            UnloadFileLocked(filePath, true);
         }
+        RebuildConfiguredAppIdsSnapshotLocked();
         return static_cast<uint32_t>(toUnload.size());
     }
 
     std::vector<AppId_t> TakePendingRemovals() {
+        std::unique_lock lock(g_configSharedMutex);
         std::vector<AppId_t> result;
         result.swap(g_pendingRemovals);
         return result;
     }
 
     std::vector<AppId_t> TakePendingAdditions() {
+        std::unique_lock lock(g_configSharedMutex);
         std::vector<AppId_t> result;
         result.swap(g_pendingAdditions);
         return result;
@@ -816,11 +1409,12 @@ namespace LuaConfig{
         if (SteamInstallPath[0] == '\0') {
             return {};
         }
-        return (std::filesystem::path(SteamInstallPath) / "depotcache").lexically_normal().string();
+        return OSTPlatform::Encoding::PathToUtf8(
+            (OSTPlatform::Encoding::PathFromUtf8(SteamInstallPath) / "depotcache").lexically_normal());
     }
 
     uint32_t SyncManifests(const std::string& directory, const std::string& targetDepotcacheDir) {
-        std::lock_guard<std::mutex> lock(g_manifestSyncMutex);
+        std::lock_guard<std::recursive_mutex> lock(g_manifestSyncMutex);
 
         std::string depotcache = !targetDepotcacheDir.empty() ? targetDepotcacheDir : GetSteamDepotcacheDir();
         if (depotcache.empty()) {
@@ -829,14 +1423,17 @@ namespace LuaConfig{
         }
 
         std::error_code ec;
-        if (!std::filesystem::exists(directory, ec) || !std::filesystem::is_directory(directory, ec))
+        auto dirPath = OSTPlatform::Encoding::PathFromUtf8(directory);
+        auto depotcachePath = OSTPlatform::Encoding::PathFromUtf8(depotcache);
+
+        if (!std::filesystem::exists(dirPath, ec) || !std::filesystem::is_directory(dirPath, ec))
             return 0;
 
-        if (!std::filesystem::exists(depotcache, ec)) {
-            std::filesystem::create_directories(depotcache, ec);
+        if (!std::filesystem::exists(depotcachePath, ec)) {
+            std::filesystem::create_directories(depotcachePath, ec);
             if (ec) {
                 LOG_MANIFEST_WARN("SyncManifests: failed to create depotcache dir '{}' ({})",
-                                  depotcache, ec.message());
+                                  OSTPlatform::Encoding::PathToUtf8(depotcachePath), ec.message());
                 return 0;
             }
         }
@@ -844,55 +1441,62 @@ namespace LuaConfig{
         uint32_t copiedCount = 0;
         uint32_t skippedCount = 0;
 
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(
-                 directory, std::filesystem::directory_options::skip_permission_denied, ec)) {
-            if (ec) break;
-            if (!entry.is_regular_file(ec)) continue;
+        try {
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(
+                     dirPath, std::filesystem::directory_options::skip_permission_denied, ec)) {
+                if (ec) break;
+                if (!entry.is_regular_file(ec)) continue;
 
-            // Skip zero-byte/incomplete source manifests
-            if (entry.file_size(ec) == 0) continue;
+                // Skip zero-byte/incomplete source manifests
+                if (entry.file_size(ec) == 0) continue;
 
-            std::string ext = entry.path().extension().string();
-            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
-                return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            });
-            if (ext != ".manifest") continue;
+                std::string ext = OSTPlatform::Encoding::PathToUtf8(entry.path().extension());
+                std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                });
+                if (ext != ".manifest") continue;
 
-            std::filesystem::path destPath = std::filesystem::path(depotcache) / entry.path().filename();
+                std::filesystem::path destPath = depotcachePath / entry.path().filename();
 
-            // Skip if destination already exists and is non-empty
-            if (std::filesystem::exists(destPath, ec) && std::filesystem::file_size(destPath, ec) > 0) {
-                if (std::filesystem::equivalent(entry.path(), destPath, ec)) {
+                // Skip if destination already exists and is non-empty
+                if (std::filesystem::exists(destPath, ec) && std::filesystem::file_size(destPath, ec) > 0) {
+                    if (std::filesystem::equivalent(entry.path(), destPath, ec)) {
+                        continue;
+                    }
+                    LOG_MANIFEST_DEBUG("SyncManifests: skipped existing manifest '{}'",
+                                       OSTPlatform::Encoding::PathToUtf8(destPath.filename()));
+                    ++skippedCount;
                     continue;
                 }
-                LOG_MANIFEST_DEBUG("SyncManifests: skipped existing manifest '{}'", destPath.filename().string());
-                ++skippedCount;
-                continue;
-            }
 
-            // Retry on temporary file sharing locks (e.g. while being extracted)
-            bool copied = false;
-            constexpr int kMaxRetries = 3;
-            for (int attempt = 1; attempt <= kMaxRetries; ++attempt) {
-                ec.clear();
-                if (std::filesystem::copy_file(entry.path(), destPath, std::filesystem::copy_options::overwrite_existing, ec)) {
-                    copied = true;
-                    break;
+                // Retry on temporary file sharing locks (e.g. while being extracted)
+                bool copied = false;
+                constexpr int kMaxRetries = 3;
+                for (int attempt = 1; attempt <= kMaxRetries; ++attempt) {
+                    ec.clear();
+                    if (std::filesystem::copy_file(entry.path(), destPath, std::filesystem::copy_options::overwrite_existing, ec)) {
+                        copied = true;
+                        break;
+                    }
+                    if (attempt < kMaxRetries &&
+                        (ec.value() == ERROR_SHARING_VIOLATION || ec.value() == ERROR_ACCESS_DENIED)) {
+                        Sleep(50);
+                    }
                 }
-                if (attempt < kMaxRetries &&
-                    (ec.value() == ERROR_SHARING_VIOLATION || ec.value() == ERROR_ACCESS_DENIED)) {
-                    Sleep(50);
-                }
-            }
 
-            if (copied) {
-                LOG_MANIFEST_INFO("SyncManifests: copied manifest '{}' -> '{}'",
-                                  entry.path().filename().string(), destPath.string());
-                ++copiedCount;
-            } else {
-                LOG_MANIFEST_WARN("SyncManifests: failed to copy manifest '{}' -> '{}' ({})",
-                                  entry.path().filename().string(), destPath.string(), ec.message());
+                if (copied) {
+                    LOG_MANIFEST_INFO("SyncManifests: copied manifest '{}' -> '{}'",
+                                      OSTPlatform::Encoding::PathToUtf8(entry.path().filename()),
+                                      OSTPlatform::Encoding::PathToUtf8(destPath));
+                    ++copiedCount;
+                } else {
+                    LOG_MANIFEST_WARN("SyncManifests: failed to copy manifest '{}' -> '{}' ({})",
+                                      OSTPlatform::Encoding::PathToUtf8(entry.path().filename()),
+                                      OSTPlatform::Encoding::PathToUtf8(destPath), ec.message());
+                }
             }
+        } catch (const std::exception& ex) {
+            LOG_MANIFEST_WARN("SyncManifests exception: {}", ex.what());
         }
 
         if (copiedCount > 0 || skippedCount > 0) {
@@ -904,38 +1508,40 @@ namespace LuaConfig{
     }
 
     bool CopyManifestToDepotcache(const std::string& manifestFilePath, const std::string& targetDepotcacheDir) {
-        std::lock_guard<std::mutex> lock(g_manifestSyncMutex);
+        std::lock_guard<std::recursive_mutex> lock(g_manifestSyncMutex);
 
         std::string depotcache = !targetDepotcacheDir.empty() ? targetDepotcacheDir : GetSteamDepotcacheDir();
         if (depotcache.empty()) return false;
 
         std::error_code ec;
-        std::filesystem::path src(manifestFilePath);
+        std::filesystem::path src = OSTPlatform::Encoding::PathFromUtf8(manifestFilePath);
         if (!std::filesystem::exists(src, ec) || !std::filesystem::is_regular_file(src, ec))
             return false;
 
         // Skip zero-byte/incomplete source manifests
         if (std::filesystem::file_size(src, ec) == 0) return false;
 
-        std::string ext = src.extension().string();
+        std::string ext = OSTPlatform::Encoding::PathToUtf8(src.extension());
         std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
             return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         });
         if (ext != ".manifest") return false;
 
-        if (!std::filesystem::exists(depotcache, ec)) {
-            std::filesystem::create_directories(depotcache, ec);
+        std::filesystem::path depotcachePath = OSTPlatform::Encoding::PathFromUtf8(depotcache);
+        if (!std::filesystem::exists(depotcachePath, ec)) {
+            std::filesystem::create_directories(depotcachePath, ec);
             if (ec) return false;
         }
 
-        std::filesystem::path dest = std::filesystem::path(depotcache) / src.filename();
+        std::filesystem::path dest = depotcachePath / src.filename();
 
         // Skip if destination already exists and is non-empty
         if (std::filesystem::exists(dest, ec) && std::filesystem::file_size(dest, ec) > 0) {
             if (std::filesystem::equivalent(src, dest, ec)) {
                 return false;
             }
-            LOG_MANIFEST_DEBUG("CopyManifestToDepotcache: skipped existing manifest '{}'", dest.filename().string());
+            LOG_MANIFEST_DEBUG("CopyManifestToDepotcache: skipped existing manifest '{}'",
+                               OSTPlatform::Encoding::PathToUtf8(dest.filename()));
             return false;
         }
 
@@ -945,7 +1551,8 @@ namespace LuaConfig{
             ec.clear();
             if (std::filesystem::copy_file(src, dest, std::filesystem::copy_options::overwrite_existing, ec)) {
                 LOG_MANIFEST_INFO("CopyManifestToDepotcache: copied manifest '{}' -> '{}'",
-                                  src.filename().string(), dest.string());
+                                  OSTPlatform::Encoding::PathToUtf8(src.filename()),
+                                  OSTPlatform::Encoding::PathToUtf8(dest));
                 return true;
             }
             if (attempt < kMaxRetries &&
@@ -955,7 +1562,7 @@ namespace LuaConfig{
         }
 
         LOG_MANIFEST_WARN("CopyManifestToDepotcache: failed to copy manifest '{}' ({})",
-                          src.filename().string(), ec.message());
+                          OSTPlatform::Encoding::PathToUtf8(src.filename()), ec.message());
         return false;
     }
 
@@ -963,107 +1570,145 @@ namespace LuaConfig{
         std::vector<std::string> files;
 
         std::error_code ec;
-        if (!std::filesystem::exists(directory, ec) || !std::filesystem::is_directory(directory, ec))
+        std::filesystem::path dirPath = OSTPlatform::Encoding::PathFromUtf8(directory);
+        if (!std::filesystem::exists(dirPath, ec) || !std::filesystem::is_directory(dirPath, ec))
             return files;
 
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(
-                 directory, std::filesystem::directory_options::skip_permission_denied, ec)) {
-            if (ec) break;
-            if (!entry.is_regular_file(ec)) continue;
+        try {
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(
+                     dirPath, std::filesystem::directory_options::skip_permission_denied, ec)) {
+                if (ec) break;
+                if (!entry.is_regular_file(ec)) continue;
 
-            std::string ext = entry.path().extension().string();
-            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
-                return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            });
-            if (ext != ".lua") continue;
+                std::string ext = OSTPlatform::Encoding::PathToUtf8(entry.path().extension());
+                std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                });
+                if (ext != ".lua") continue;
 
-            files.push_back(entry.path().lexically_normal().string());
+                files.push_back(OSTPlatform::Encoding::PathToUtf8(entry.path().lexically_normal()));
+            }
+        } catch (const std::exception& ex) {
+            LOG_PACKAGE_WARN("CollectLuaFiles exception: {}", ex.what());
         }
         std::sort(files.begin(), files.end());
         return files;
     }
 
     // ── single-file parser ──────────────────────────────────────
-    void ParseFile(const std::string& rawFilePath) {
+    void ParseFile(const std::string& rawFilePath, bool rebuildSnapshot) {
         if (!Initialize()) return;
 
-        std::string filePath = std::filesystem::path(rawFilePath).lexically_normal().string();
+        std::filesystem::path path = OSTPlatform::Encoding::PathFromUtf8(rawFilePath).lexically_normal();
+        std::string filePath = OSTPlatform::Encoding::PathToUtf8(path);
+        std::string filenameUtf8 = OSTPlatform::Encoding::PathToUtf8(path.filename());
 
-        // Remove old entries from this file before re-parsing.
-        UnloadFile(filePath);
-        g_currentFile = filePath;
-
-        std::filesystem::path path(filePath);
         std::ifstream file(path);
         if (!file) {
-            LOG_WARN("ParseFile: failed to open {}", path.filename().string());
-            g_currentFile.clear();
+            LOG_WARN("ParseFile: failed to open {}", filenameUtf8);
             return;
         }
-        g_fileParseSequence[filePath] = ++g_nextFileParseSequence;
-        
+
         // Capture the file's last-modified time (unix epoch, seconds) so
         // lua_addappid can stamp it onto every appId this file contributes.
-        // Portable conversion that does not require C++20 clock_cast.
+        uint32_t mtime = 0;
         {
             std::error_code ec;
             auto ftime = std::filesystem::last_write_time(path, ec);
-            uint32_t mtime = 0;
             if (!ec) {
-                auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-                    ftime - decltype(ftime)::clock::now() + std::chrono::system_clock::now());
+                auto sctp = std::chrono::clock_cast<std::chrono::system_clock>(ftime);
                 mtime = static_cast<uint32_t>(std::chrono::system_clock::to_time_t(sctp));
             }
-            g_fileMtime[filePath] = mtime;
         }
 
-        std::string chunk, line;
-        int lineNo = 0;
-        while (std::getline(file, line)) {
-            ++lineNo;
-            if (!chunk.empty()) chunk += '\n';
-            chunk += line;
+        std::unique_lock configLock(g_configSharedMutex);
+        std::lock_guard luaLock(g_luaStateMutex);
 
-            lua_settop(g_lua_state, 0);
-            int rc = luaL_loadstring(g_lua_state, chunk.c_str());
-            if (rc == LUA_OK) {
-                if (lua_pcall(g_lua_state, 0, 0, 0) != LUA_OK) {
-                    const char* err = lua_tostring(g_lua_state, -1);
-                    LOG_WARN("{}:{}: {}", path.filename().string(), lineNo,
-                             err ? err : "unknown");
+        // Remove old entries from this file before re-parsing.
+        UnloadFileLocked(filePath, false);
+        g_currentFile = filePath;
+        g_fileParseSequence[filePath] = ++g_nextFileParseSequence;
+        g_fileMtime[filePath] = mtime;
+
+        try {
+            std::string chunk, line;
+            int lineNo = 0;
+            while (std::getline(file, line)) {
+                ++lineNo;
+                // Strip UTF-8 BOM if present on the first line
+                if (lineNo == 1 && line.size() >= 3 &&
+                    static_cast<unsigned char>(line[0]) == 0xEF &&
+                    static_cast<unsigned char>(line[1]) == 0xBB &&
+                    static_cast<unsigned char>(line[2]) == 0xBF) {
+                    line.erase(0, 3);
                 }
-                chunk.clear();
-            } else if (rc == LUA_ERRSYNTAX) {
-                lua_pop(g_lua_state, 1);
-            } else {
-                const char* err = lua_tostring(g_lua_state, -1);
-                LOG_WARN("{}:{}: {}", path.filename().string(), lineNo, err ? err : "unknown");
-                lua_pop(g_lua_state, 1);
-                chunk.clear();
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
+                if (!chunk.empty()) chunk += '\n';
+                chunk += line;
+
+                lua_settop(g_lua_state, 0);
+                int rc = luaL_loadstring(g_lua_state, chunk.c_str());
+                if (rc == LUA_OK) {
+                    if (lua_pcall(g_lua_state, 0, 0, 0) != LUA_OK) {
+                        const char* err = lua_tostring(g_lua_state, -1);
+                        LOG_WARN("{}:{}: {}", filenameUtf8, lineNo,
+                                 err ? err : "unknown");
+                        lua_pop(g_lua_state, 1);
+                    }
+                    chunk.clear();
+                } else if (rc == LUA_ERRSYNTAX) {
+                    const char* err = lua_tostring(g_lua_state, -1);
+                    if (err && strstr(err, "<eof>") != nullptr) {
+                        // Incomplete multi-line statement: keep accumulating
+                        lua_pop(g_lua_state, 1);
+                    } else {
+                        // Genuine syntax error on this statement: log and discard bad chunk
+                        // so following valid statements in the file are not dropped.
+                        LOG_WARN("{}:{}: {}", filenameUtf8, lineNo, err ? err : "syntax error");
+                        lua_pop(g_lua_state, 1);
+                        chunk.clear();
+                    }
+                } else {
+                    const char* err = lua_tostring(g_lua_state, -1);
+                    LOG_WARN("{}:{}: {}", filenameUtf8, lineNo, err ? err : "unknown");
+                    lua_pop(g_lua_state, 1);
+                    chunk.clear();
+                }
             }
-        }
-        if (!chunk.empty()) {
-            LOG_WARN("{}: incomplete statement at end of file", path.filename().string());
+            if (!chunk.empty()) {
+                LOG_WARN("{}: incomplete statement at end of file", filenameUtf8);
+            }
+        } catch (const std::exception& ex) {
+            LOG_WARN("ParseFile exception in {}: {}", filenameUtf8, ex.what());
         }
 
         // Check for manifest code functions after parsing.
-        g_hasManifestCodeFunc = false;
         lua_getglobal(g_lua_state, "fetch_manifest_code");
         if (lua_isfunction(g_lua_state, -1)) {
-            g_hasManifestCodeFunc = true;
-            LOG_INFO("manifest.lua: fetch_manifest_code found");
+            if (g_manifestCodeFuncFile.empty() || g_manifestCodeFuncFile == filePath) {
+                g_manifestCodeFuncFile = filePath;
+                g_hasManifestCodeFunc.store(true, std::memory_order_relaxed);
+                LOG_INFO("LuaConfig: fetch_manifest_code found in {}", filenameUtf8);
+            }
         }
         lua_pop(g_lua_state, 1);
 
-        g_hasManifestCodeFuncEx = false;
         lua_getglobal(g_lua_state, "fetch_manifest_code_ex");
         if (lua_isfunction(g_lua_state, -1)) {
-            g_hasManifestCodeFuncEx = true;
-            LOG_INFO("manifest.lua: fetch_manifest_code_ex found");
+            if (g_manifestCodeFuncExFile.empty() || g_manifestCodeFuncExFile == filePath) {
+                g_manifestCodeFuncExFile = filePath;
+                g_hasManifestCodeFuncEx.store(true, std::memory_order_relaxed);
+                LOG_INFO("LuaConfig: fetch_manifest_code_ex found in {}", filenameUtf8);
+            }
         }
         lua_pop(g_lua_state, 1);
 
         g_currentFile.clear();
+        if (rebuildSnapshot) {
+            RebuildConfiguredAppIdsSnapshotLocked();
+        }
     }
 
     // ── directory scanner ────────────────────────────────────────
@@ -1073,12 +1718,14 @@ namespace LuaConfig{
         SyncManifests(directory);
 
         for (const auto& filePath : CollectLuaFiles(directory)) {
-            ParseFile(filePath);
+            ParseFile(filePath, false);
         }
 
         // Initial parse — discard pending additions so NotifyLicenseChanged
         // only sees changes that happen after startup.
+        std::unique_lock lock(g_configSharedMutex);
         g_pendingAdditions.clear();
+        RebuildConfiguredAppIdsSnapshotLocked();
     }
 
     void ReloadDirectories(const std::vector<std::string>& directories, bool clearPendingAdditions) {
@@ -1099,37 +1746,98 @@ namespace LuaConfig{
             }
         }
 
-        std::unordered_set<std::string> trackedSet;
         std::vector<std::string> trackedFiles;
-        auto rememberTracked = [&](const std::string& filePath) {
-            if (trackedSet.insert(filePath).second) {
-                trackedFiles.push_back(filePath);
-            }
-        };
+        {
+            std::shared_lock lock(g_configSharedMutex);
+            std::unordered_set<std::string> trackedSet;
+            auto rememberTracked = [&](const std::string& filePath) {
+                if (trackedSet.insert(filePath).second) {
+                    trackedFiles.push_back(filePath);
+                }
+            };
 
-        for (const auto& [filePath, _] : g_fileDepots) {
-            rememberTracked(filePath);
-        }
-        for (const auto& [filePath, _] : g_fileManifestOverrides) {
-            rememberTracked(filePath);
-        }
-        for (const auto& [filePath, _] : g_fileParseSequence) {
-            rememberTracked(filePath);
+            for (const auto& [filePath, _] : g_fileDepots) {
+                rememberTracked(filePath);
+            }
+            for (const auto& [filePath, _] : g_fileManifestOverrides) {
+                rememberTracked(filePath);
+            }
+            for (const auto& [filePath, _] : g_fileAppTickets) {
+                rememberTracked(filePath);
+            }
+            for (const auto& [filePath, _] : g_fileETickets) {
+                rememberTracked(filePath);
+            }
+            for (const auto& [filePath, _] : g_fileTokens) {
+                rememberTracked(filePath);
+            }
+            for (const auto& [filePath, _] : g_fileProcesses) {
+                rememberTracked(filePath);
+            }
+            for (const auto& [filePath, _] : g_fileForcedDenuvo) {
+                rememberTracked(filePath);
+            }
+            for (const auto& [filePath, _] : g_fileNoDenuvo) {
+                rememberTracked(filePath);
+            }
+            for (const auto& [filePath, _] : g_fileDAuth2) {
+                rememberTracked(filePath);
+            }
+            for (const auto& [filePath, _] : g_filePinnedApps) {
+                rememberTracked(filePath);
+            }
+            for (const auto& [filePath, _] : g_fileStats) {
+                rememberTracked(filePath);
+            }
+            for (const auto& [filePath, _] : g_fileEticketUrl) {
+                rememberTracked(filePath);
+            }
+            for (const auto& [filePath, _] : g_fileParseSequence) {
+                rememberTracked(filePath);
+            }
         }
 
         for (const auto& filePath : trackedFiles) {
             if (!activeFiles.contains(filePath)) {
-                UnloadFile(filePath);
+                UnloadFile(filePath, true, false);
             }
         }
 
         for (const auto& filePath : orderedFiles) {
-            ParseFile(filePath);
+            ParseFile(filePath, false);
         }
 
+        std::unique_lock lock(g_configSharedMutex);
         if (clearPendingAdditions) {
             g_pendingAdditions.clear();
         }
+        RebuildConfiguredAppIdsSnapshotLocked();
     }
 
+    std::string FindLuaFileForAppId(AppId_t appId) {
+        std::shared_lock lock(g_configSharedMutex);
+        for (const auto& [filePath, depots] : g_fileDepots) {
+            if (depots.contains(appId)) {
+                return filePath;
+            }
+        }
+        for (const auto& [filePath, tickets] : g_fileAppTickets) {
+            if (tickets.contains(appId)) {
+                return filePath;
+            }
+        }
+        return {};
+    }
+
+    std::shared_ptr<const std::vector<AppId_t>> GetConfiguredAppIdsSnapshot() {
+        return s_configuredAppIdsSnapshot.load();
+    }
+
+    std::vector<AppId_t> GetConfiguredAppIds() {
+        auto snapshot = GetConfiguredAppIdsSnapshot();
+        if (snapshot) {
+            return *snapshot;
+        }
+        return {};
+    }
 }

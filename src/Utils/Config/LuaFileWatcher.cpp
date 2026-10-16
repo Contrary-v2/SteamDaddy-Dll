@@ -1,19 +1,23 @@
-#include "Hook/Hooks_Package.h"
 #include "Utils/Config/LuaFileWatcher.h"
 #include "Utils/Config/LuaConfig.h"
 #include "Utils/CloudRedirect/CloudRedirectHost.h"
 #include "Utils/Logging/Log.h"
 #include "OSTPlatform/include/DirectoryWatch.h"
+#include "OSTPlatform/include/Encoding.h"
+#include "OSTPlatform/include/Thread.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <filesystem>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace LuaFileWatcher {
 namespace {
 
+std::atomic<LicenseChangedCallback> g_licenseChangedCb{nullptr};
 enum class ChangeAction {
     Added,
     Modified,
@@ -26,7 +30,7 @@ struct FileChange {
 };
 
 std::atomic<bool> g_running{false};
-std::thread g_watcherThread;
+OSTPlatform::Thread::SafeThread g_watcherThread;
 std::vector<std::string> g_watchDirs;
 
 constexpr uint32_t kDebounceMs = 500;
@@ -34,6 +38,13 @@ constexpr uint32_t kDebounceMs = 500;
 bool IsLuaFile(const std::string& path) {
     if (path.size() < 4) return false;
     return std::equal(path.end() - 4, path.end(), ".lua", [](char lhs, char rhs) {
+        return std::tolower(static_cast<unsigned char>(lhs)) == std::tolower(static_cast<unsigned char>(rhs));
+    });
+}
+
+bool IsManifestFile(const std::string& path) {
+    if (path.size() < 9) return false;
+    return std::equal(path.end() - 9, path.end(), ".manifest", [](char lhs, char rhs) {
         return std::tolower(static_cast<unsigned char>(lhs)) == std::tolower(static_cast<unsigned char>(rhs));
     });
 }
@@ -87,46 +98,102 @@ std::vector<FileChange> FlattenChanges(
 std::vector<FileChange> ToFileChanges(
     const std::string& dir,
     const std::vector<OSTPlatform::DirectoryWatch::Change>& changes) {
+    using OSTPlatform::Encoding::PathFromUtf8;
+    using OSTPlatform::Encoding::PathToUtf8;
     std::vector<FileChange> result;
     result.reserve(changes.size());
     for (const auto& change : changes) {
         if (change.relativePath.empty()) continue;
-        result.push_back({dir + "\\" + change.relativePath, FromPlatformAction(change.action)});
+        std::string fullPath = PathToUtf8((PathFromUtf8(dir) / PathFromUtf8(change.relativePath)).lexically_normal());
+        result.push_back({std::move(fullPath), FromPlatformAction(change.action)});
     }
     return result;
 }
 
 void ProcessChanges(const std::vector<FileChange>& changes) {
-    std::vector<FileChange> luaChanges;
-    for (const auto& change : changes) {
-        if (IsLuaFile(change.path)) {
-            luaChanges.push_back(change);
-        }
-    }
-    if (luaChanges.empty()) return;
+    using OSTPlatform::Encoding::PathFromUtf8;
+    using OSTPlatform::Encoding::PathToUtf8;
+    bool luaStateChanged = false;
+    std::unordered_set<std::string> processedLua;
 
-    LOG_PACKAGE_DEBUG("Processing {} Lua file change(s)", luaChanges.size());
-    for (const auto& change : luaChanges) {
-        LOG_PACKAGE_TRACE("Lua file {}: {}", ToString(change.action), change.path);
-        if (change.action == ChangeAction::Removed) {
-            LuaConfig::UnloadFile(change.path);
-        } else {
-            LuaConfig::ParseFile(change.path);
+    try {
+        for (const auto& change : changes) {
+            if (IsManifestFile(change.path)) {
+                if (change.action == ChangeAction::Added || change.action == ChangeAction::Modified) {
+                    LOG_PACKAGE_TRACE("Manifest file {}: {}", ToString(change.action), change.path);
+                    LuaConfig::CopyManifestToDepotcache(change.path);
+                }
+                continue;
+            }
+
+            if (IsLuaFile(change.path)) {
+                LOG_PACKAGE_TRACE("Lua file {}: {}", ToString(change.action), change.path);
+                std::string normPath = PathToUtf8(PathFromUtf8(change.path).lexically_normal());
+                if (change.action == ChangeAction::Removed) {
+                    LuaConfig::UnloadFile(normPath, true);
+                    luaStateChanged = true;
+                } else {
+                    if (processedLua.insert(normPath).second) {
+                        LuaConfig::ParseFile(normPath);
+                        luaStateChanged = true;
+                    }
+                }
+                continue;
+            }
+
+            // Handle subdirectories added or removed
+            std::error_code ec;
+            auto changeFsPath = PathFromUtf8(change.path);
+            if (change.action == ChangeAction::Removed) {
+                LOG_PACKAGE_TRACE("Resource removed: {}", change.path);
+                if (LuaConfig::UnloadDirectory(change.path) > 0) {
+                    luaStateChanged = true;
+                }
+            } else if (change.action == ChangeAction::Added || change.action == ChangeAction::Modified) {
+                if (std::filesystem::exists(changeFsPath, ec) && std::filesystem::is_directory(changeFsPath, ec)) {
+                    LOG_PACKAGE_TRACE("Directory added/modified: {}", change.path);
+                    LuaConfig::SyncManifests(change.path);
+                    for (const auto& entry : std::filesystem::recursive_directory_iterator(
+                             changeFsPath, std::filesystem::directory_options::skip_permission_denied, ec)) {
+                        if (ec) break;
+                        if (!entry.is_regular_file(ec)) continue;
+                        std::string entryPathUtf8 = PathToUtf8(entry.path());
+                        if (IsLuaFile(entryPathUtf8)) {
+                            std::string normPath = PathToUtf8(entry.path().lexically_normal());
+                            if (processedLua.insert(normPath).second) {
+                                LuaConfig::ParseFile(normPath);
+                                luaStateChanged = true;
+                            }
+                        }
+                    }
+                }
+            }
         }
+    } catch (const std::exception& ex) {
+        LOG_PACKAGE_WARN("ProcessChanges exception: {}", ex.what());
     }
 
-    Hooks_Package::NotifyLicenseChanged();
-    CloudRedirectHost::SyncAppSet();
-    LOG_PACKAGE_DEBUG("Lua refresh completed");
+    if (luaStateChanged) {
+        if (auto cb = g_licenseChangedCb.load(std::memory_order_relaxed)) {
+            cb();
+        }
+        CloudRedirectHost::SyncAppSet();
+        LOG_PACKAGE_DEBUG("Lua refresh completed");
+    }
 }
 
 void WatcherThread() {
+    struct RunningGuard {
+        std::atomic<bool>& flag;
+        ~RunningGuard() { flag.store(false, std::memory_order_release); }
+    } runningGuard{g_running};
+
     const size_t numDirs = g_watchDirs.size();
     std::vector<OSTPlatform::DirectoryWatch::Watch> watches(numDirs);
     std::vector<OSTPlatform::DirectoryWatch::Watch*> watchPtrs(numDirs, nullptr);
 
     for (size_t i = 0; i < numDirs; ++i) {
-        if (!watches[i].Open(g_watchDirs[i], 65536)) {
+        if (!watches[i].Open(g_watchDirs[i], 65536, true)) {
             LOG_PACKAGE_WARN("Failed to open Lua watch directory: {}", g_watchDirs[i]);
             continue;
         }
@@ -161,35 +228,39 @@ void WatcherThread() {
         watch->IssueRead();
     };
 
-    while (g_running) {
-        auto waitResult = OSTPlatform::DirectoryWatch::WaitAny(watchPtrs, 1000);
-
-        if (!g_running) break;
-        if (waitResult.status == OSTPlatform::DirectoryWatch::WaitStatus::Timeout) continue;
-        if (waitResult.status != OSTPlatform::DirectoryWatch::WaitStatus::Signaled ||
-            waitResult.index >= numDirs) {
-            continue;
-        }
-
-        std::unordered_map<std::string, ChangeAction> accumulated;
-        std::vector<std::string> order;
-
-        drainEvent(waitResult.index, accumulated, order);
-
+    try {
         while (g_running) {
-            auto debounceResult = OSTPlatform::DirectoryWatch::WaitAny(watchPtrs, kDebounceMs);
-            if (!g_running) break;
-            if (debounceResult.status == OSTPlatform::DirectoryWatch::WaitStatus::Timeout) break;
-            if (debounceResult.status != OSTPlatform::DirectoryWatch::WaitStatus::Signaled ||
-                debounceResult.index >= numDirs) {
-                break;
-            }
-            drainEvent(debounceResult.index, accumulated, order);
-        }
+            auto waitResult = OSTPlatform::DirectoryWatch::WaitAny(watchPtrs, 1000);
 
-        if (!order.empty()) {
-            ProcessChanges(FlattenChanges(accumulated, order));
+            if (!g_running) break;
+            if (waitResult.status == OSTPlatform::DirectoryWatch::WaitStatus::Timeout) continue;
+            if (waitResult.status != OSTPlatform::DirectoryWatch::WaitStatus::Signaled ||
+                waitResult.index >= numDirs) {
+                continue;
+            }
+
+            std::unordered_map<std::string, ChangeAction> accumulated;
+            std::vector<std::string> order;
+
+            drainEvent(waitResult.index, accumulated, order);
+
+            while (g_running) {
+                auto debounceResult = OSTPlatform::DirectoryWatch::WaitAny(watchPtrs, kDebounceMs);
+                if (!g_running) break;
+                if (debounceResult.status == OSTPlatform::DirectoryWatch::WaitStatus::Timeout) break;
+                if (debounceResult.status != OSTPlatform::DirectoryWatch::WaitStatus::Signaled ||
+                    debounceResult.index >= numDirs) {
+                    break;
+                }
+                drainEvent(debounceResult.index, accumulated, order);
+            }
+
+            if (!order.empty()) {
+                ProcessChanges(FlattenChanges(accumulated, order));
+            }
         }
+    } catch (const std::exception& ex) {
+        LOG_PACKAGE_WARN("WatcherThread exception: {}", ex.what());
     }
 
     for (auto& watch : watches) {
@@ -200,21 +271,42 @@ void WatcherThread() {
 
 } // namespace
 
+void SetLicenseChangedCallback(LicenseChangedCallback cb) {
+    g_licenseChangedCb.store(cb, std::memory_order_release);
+}
+
 void Start(const std::vector<std::string>& directories) {
+    using OSTPlatform::Encoding::PathFromUtf8;
+    using OSTPlatform::Encoding::PathToUtf8;
     if (g_running.exchange(true)) {
         LOG_PACKAGE_WARN("Lua watcher already running");
         return;
     }
 
-    g_watchDirs = directories;
+    std::vector<std::string> uniqueDirs;
+    std::unordered_set<std::string> seen;
+    for (const auto& d : directories) {
+        std::string norm = PathToUtf8(PathFromUtf8(d).lexically_normal());
+        if (seen.insert(norm).second) {
+            uniqueDirs.push_back(norm);
+        }
+    }
+
+    g_watchDirs = std::move(uniqueDirs);
     g_watcherThread = std::thread(WatcherThread);
 }
 
 void Stop() {
-    if (!g_running) return;
-    g_running = false;
+    g_running.store(false, std::memory_order_release);
     if (g_watcherThread.joinable()) {
         g_watcherThread.join();
+    }
+}
+
+void Detach() {
+    g_running.store(false, std::memory_order_release);
+    if (g_watcherThread.joinable()) {
+        g_watcherThread.detach();
     }
 }
 
