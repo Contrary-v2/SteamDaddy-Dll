@@ -7,8 +7,10 @@
 
 #include <lua.hpp>
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <unordered_set>
@@ -28,6 +30,15 @@ namespace LuaConfig{
     std::unordered_map<uint64_t, ManifestOverride> ManifestOverrides{};
     std::unordered_map<AppId_t, uint64_t> StatSteamIdSet{};
     std::unordered_set<AppId_t> OwnedAppIdSet{};
+    // Process exe name (lowercase) → appid; populated by addprocess() in Lua config.
+    std::unordered_map<std::string, AppId_t> ProcessNameAppIdMap{};
+    // App IDs that should bypass ProtectionScan and be treated as Denuvo games.
+    std::unordered_set<AppId_t> ForcedDenuvoSet{};
+    // App IDs that should bypass ProtectionScan and be treated as non-Denuvo games.
+    std::unordered_set<AppId_t> NoDenuvoSet{};
+    // On-demand eticket mint endpoint, set via seteticketurl() in Lua config.
+    // Empty = disabled (EticketClient falls back to credential-store ticket).
+    std::string EticketUrl{};
 
     // Per-file tracking: which depots each .lua file contributed.
     static std::string g_currentFile;
@@ -266,6 +277,55 @@ namespace LuaConfig{
         return 0;
     }
 
+    static int lua_addprocess(lua_State* L) {
+        // addprocess(appid, "ExeName.exe")
+        // Maps a process exe name to an appid so OST can identify games
+        // that launch without exporting SteamAppId env vars.
+        int argc = lua_gettop(L);
+        if (argc < 2 || !lua_isinteger(L, 1) || !lua_isstring(L, 2))
+            return luaL_error(L, "addprocess requires (appid: integer, exename: string)");
+        lua_Integer value = lua_tointeger(L, 1);
+        if (value <= 0 || value > static_cast<lua_Integer>(UINT32_MAX))
+            return luaL_error(L, "addprocess: appid out of range");
+        std::string name(lua_tostring(L, 2));
+        for (char& ch : name)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        ProcessNameAppIdMap[name] = static_cast<AppId_t>(value);
+        return 0;
+    }
+
+    static int lua_forcedenuvo(lua_State* L) {
+        // forcedenuvo(appid) — bypass ProtectionScan for games where the heuristic fails.
+        if (lua_gettop(L) < 1 || !lua_isinteger(L, 1))
+            return luaL_error(L, "forcedenuvo requires (appid: integer)");
+        lua_Integer value = lua_tointeger(L, 1);
+        if (value <= 0 || value > static_cast<lua_Integer>(UINT32_MAX))
+            return luaL_error(L, "forcedenuvo: appid out of range");
+        ForcedDenuvoSet.insert(static_cast<AppId_t>(value));
+        return 0;
+    }
+
+    static int lua_nodenuvo(lua_State* L) {
+        // nodenuvo(appid) — explicitly mark as non-Denuvo, bypassing ProtectionScan.
+        if (lua_gettop(L) < 1 || !lua_isinteger(L, 1))
+            return luaL_error(L, "nodenuvo requires (appid: integer)");
+        lua_Integer value = lua_tointeger(L, 1);
+        if (value <= 0 || value > static_cast<lua_Integer>(UINT32_MAX))
+            return luaL_error(L, "nodenuvo: appid out of range");
+        NoDenuvoSet.insert(static_cast<AppId_t>(value));
+        return 0;
+    }
+
+    static int lua_seteticketurl(lua_State* L) {
+        // seteticketurl("http://your-backend/eticket")
+        // Endpoint that mints fresh nonce-bound encrypted app tickets for
+        // strict Denuvo titles. Set to "" (or omit the call) to disable.
+        if (lua_gettop(L) < 1 || !lua_isstring(L, 1))
+            return luaL_error(L, "seteticketurl requires (url: string)");
+        EticketUrl = std::string(lua_tostring(L, 1));
+        return 0;
+    }
+
     static int lua_pinApp(lua_State* L) {
         // pinApp(integer)
         int argc = lua_gettop(L);
@@ -443,6 +503,11 @@ namespace LuaConfig{
         // (e.g. setAppTICKET, addAppId, SETManifestid, etc.).
         register_func(g_lua_state, "addappid", lua_addappid);
         register_func(g_lua_state, "addtoken", lua_addtoken);
+        register_func(g_lua_state, "addprocess", lua_addprocess);
+        register_func(g_lua_state, "forcedenuvo", lua_forcedenuvo);
+        register_func(g_lua_state, "nodenuvo", lua_nodenuvo);
+        register_func(g_lua_state, "disallowdenuvo", lua_nodenuvo);
+        register_func(g_lua_state, "seteticketurl", lua_seteticketurl);
         // we don't need it?
         // register_func(g_lua_state, "pinapp", lua_pinApp);
         register_func(g_lua_state, "setmanifestid", lua_setManifestid);
@@ -463,6 +528,26 @@ namespace LuaConfig{
     }
 
     // ── public query API ─────────────────────────────────────────
+    AppId_t GetAppIdForProcess(const std::string& imageName) {
+        std::string lower(imageName);
+        for (char& ch : lower)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        const auto it = ProcessNameAppIdMap.find(lower);
+        return it != ProcessNameAppIdMap.end() ? it->second : k_uAppIdInvalid;
+    }
+
+    bool IsForcedDenuvo(AppId_t appId) {
+        return ForcedDenuvoSet.count(appId) > 0;
+    }
+
+    bool IsNoDenuvo(AppId_t appId) {
+        return NoDenuvoSet.count(appId) > 0;
+    }
+
+    const std::string& GetEticketUrl() {
+        return EticketUrl;
+    }
+
     bool HasDepot(AppId_t DepotId,bool excludeOwned) {
         return DepotKeySet.count(DepotId) && (!excludeOwned || !IsOwned(DepotId));
     }
@@ -629,7 +714,8 @@ namespace LuaConfig{
     }
 
     // ── per-file unload ────────────────────────────────────────
-    void UnloadFile(const std::string& filePath) {
+    void UnloadFile(const std::string& rawFilePath) {
+        std::string filePath = std::filesystem::path(rawFilePath).lexically_normal().string();
         auto depotsIt = g_fileDepots.find(filePath);
         auto manifestIt = g_fileManifestOverrides.find(filePath);
         if (depotsIt == g_fileDepots.end() && manifestIt == g_fileManifestOverrides.end()) return;
@@ -668,6 +754,40 @@ namespace LuaConfig{
         g_fileMtime.erase(filePath);
     }
 
+    static bool StartsWithCaseInsensitive(std::string_view str, std::string_view prefix) {
+        if (str.size() < prefix.size()) return false;
+        return _strnicmp(str.data(), prefix.data(), prefix.size()) == 0;
+    }
+
+    uint32_t UnloadDirectory(const std::string& rawDirPath) {
+        std::string dirPath = std::filesystem::path(rawDirPath).lexically_normal().string();
+        if (dirPath.empty()) return 0;
+        if (dirPath.back() != '\\' && dirPath.back() != '/') {
+            dirPath += '\\';
+        }
+
+        std::vector<std::string> toUnload;
+        for (const auto& [filePath, _] : g_fileDepots) {
+            if (StartsWithCaseInsensitive(filePath, dirPath)) {
+                toUnload.push_back(filePath);
+            }
+        }
+        for (const auto& [filePath, _] : g_fileManifestOverrides) {
+            if (StartsWithCaseInsensitive(filePath, dirPath)) {
+                toUnload.push_back(filePath);
+            }
+        }
+
+        std::sort(toUnload.begin(), toUnload.end());
+        toUnload.erase(std::unique(toUnload.begin(), toUnload.end()), toUnload.end());
+
+        for (const auto& filePath : toUnload) {
+            LOG_PACKAGE_INFO("UnloadDirectory: unloading file '{}' from removed dir '{}'", filePath, rawDirPath);
+            UnloadFile(filePath);
+        }
+        return static_cast<uint32_t>(toUnload.size());
+    }
+
     std::vector<AppId_t> TakePendingRemovals() {
         std::vector<AppId_t> result;
         result.swap(g_pendingRemovals);
@@ -680,27 +800,204 @@ namespace LuaConfig{
         return result;
     }
 
+    std::string GetSteamDepotcacheDir() {
+        if (SteamInstallPath[0] != '\0') {
+            return (std::filesystem::path(SteamInstallPath) / "depotcache").string();
+        }
+
+        // Fallback: query registry HKCU / HKLM using Unicode APIs for full multi-language path support
+        HKEY hKey = nullptr;
+        const HKEY rootKeys[] = { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE };
+        const wchar_t* subKeys[] = {
+            L"Software\\Valve\\Steam",
+            L"Software\\Wow6432Node\\Valve\\Steam"
+        };
+
+        for (HKEY root : rootKeys) {
+            for (const wchar_t* sub : subKeys) {
+                if (RegOpenKeyExW(root, sub, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                    wchar_t pathBuf[MAX_PATH] = {};
+                    DWORD bufSize = sizeof(pathBuf);
+                    DWORD type = REG_SZ;
+                    if ((RegQueryValueExW(hKey, L"SteamPath", nullptr, &type, reinterpret_cast<LPBYTE>(pathBuf), &bufSize) == ERROR_SUCCESS ||
+                         RegQueryValueExW(hKey, L"InstallPath", nullptr, &type, reinterpret_cast<LPBYTE>(pathBuf), &bufSize) == ERROR_SUCCESS) &&
+                        pathBuf[0] != L'\0') {
+                        RegCloseKey(hKey);
+                        return (std::filesystem::path(pathBuf) / "depotcache").string();
+                    }
+                    RegCloseKey(hKey);
+                }
+            }
+        }
+
+        return {};
+    }
+
+    uint32_t SyncManifests(const std::string& directory, const std::string& targetDepotcacheDir) {
+        std::string depotcache = !targetDepotcacheDir.empty() ? targetDepotcacheDir : GetSteamDepotcacheDir();
+        if (depotcache.empty()) {
+            LOG_MANIFEST_WARN("SyncManifests: Steam depotcache directory could not be resolved");
+            return 0;
+        }
+
+        std::error_code ec;
+        if (!std::filesystem::exists(directory, ec) || !std::filesystem::is_directory(directory, ec))
+            return 0;
+
+        if (!std::filesystem::exists(depotcache, ec)) {
+            std::filesystem::create_directories(depotcache, ec);
+            if (ec) {
+                LOG_MANIFEST_WARN("SyncManifests: failed to create depotcache dir '{}' ({})",
+                                  depotcache, ec.message());
+                return 0;
+            }
+        }
+
+        uint32_t copiedCount = 0;
+        uint32_t skippedCount = 0;
+
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(
+                 directory, std::filesystem::directory_options::skip_permission_denied, ec)) {
+            if (ec) break;
+            if (!entry.is_regular_file(ec)) continue;
+
+            // Skip zero-byte/incomplete source manifests
+            if (entry.file_size(ec) == 0) continue;
+
+            std::string ext = entry.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            });
+            if (ext != ".manifest") continue;
+
+            std::filesystem::path destPath = std::filesystem::path(depotcache) / entry.path().filename();
+
+            // Skip if destination already exists and is non-empty
+            if (std::filesystem::exists(destPath, ec) && std::filesystem::file_size(destPath, ec) > 0) {
+                if (std::filesystem::equivalent(entry.path(), destPath, ec)) {
+                    continue;
+                }
+                LOG_MANIFEST_DEBUG("SyncManifests: skipped existing manifest '{}'", destPath.filename().string());
+                ++skippedCount;
+                continue;
+            }
+
+            // Retry on temporary file sharing locks (e.g. while being extracted)
+            bool copied = false;
+            constexpr int kMaxRetries = 3;
+            for (int attempt = 1; attempt <= kMaxRetries; ++attempt) {
+                ec.clear();
+                if (std::filesystem::copy_file(entry.path(), destPath, std::filesystem::copy_options::overwrite_existing, ec)) {
+                    copied = true;
+                    break;
+                }
+                if (attempt < kMaxRetries &&
+                    (ec.value() == ERROR_SHARING_VIOLATION || ec.value() == ERROR_ACCESS_DENIED)) {
+                    Sleep(50);
+                }
+            }
+
+            if (copied) {
+                LOG_MANIFEST_INFO("SyncManifests: copied manifest '{}' -> '{}'",
+                                  entry.path().filename().string(), destPath.string());
+                ++copiedCount;
+            } else {
+                LOG_MANIFEST_WARN("SyncManifests: failed to copy manifest '{}' -> '{}' ({})",
+                                  entry.path().filename().string(), destPath.string(), ec.message());
+            }
+        }
+
+        if (copiedCount > 0 || skippedCount > 0) {
+            LOG_MANIFEST_INFO("SyncManifests: {} manifest(s) copied, {} duplicate(s) skipped from '{}' to '{}'",
+                              copiedCount, skippedCount, directory, depotcache);
+        }
+
+        return copiedCount;
+    }
+
+    bool CopyManifestToDepotcache(const std::string& manifestFilePath, const std::string& targetDepotcacheDir) {
+        std::string depotcache = !targetDepotcacheDir.empty() ? targetDepotcacheDir : GetSteamDepotcacheDir();
+        if (depotcache.empty()) return false;
+
+        std::error_code ec;
+        std::filesystem::path src(manifestFilePath);
+        if (!std::filesystem::exists(src, ec) || !std::filesystem::is_regular_file(src, ec))
+            return false;
+
+        // Skip zero-byte/incomplete source manifests
+        if (std::filesystem::file_size(src, ec) == 0) return false;
+
+        std::string ext = src.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        });
+        if (ext != ".manifest") return false;
+
+        if (!std::filesystem::exists(depotcache, ec)) {
+            std::filesystem::create_directories(depotcache, ec);
+            if (ec) return false;
+        }
+
+        std::filesystem::path dest = std::filesystem::path(depotcache) / src.filename();
+
+        // Skip if destination already exists and is non-empty
+        if (std::filesystem::exists(dest, ec) && std::filesystem::file_size(dest, ec) > 0) {
+            if (std::filesystem::equivalent(src, dest, ec)) {
+                return false;
+            }
+            LOG_MANIFEST_DEBUG("CopyManifestToDepotcache: skipped existing manifest '{}'", dest.filename().string());
+            return false;
+        }
+
+        // Retry on temporary file sharing locks
+        constexpr int kMaxRetries = 3;
+        for (int attempt = 1; attempt <= kMaxRetries; ++attempt) {
+            ec.clear();
+            if (std::filesystem::copy_file(src, dest, std::filesystem::copy_options::overwrite_existing, ec)) {
+                LOG_MANIFEST_INFO("CopyManifestToDepotcache: copied manifest '{}' -> '{}'",
+                                  src.filename().string(), dest.string());
+                return true;
+            }
+            if (attempt < kMaxRetries &&
+                (ec.value() == ERROR_SHARING_VIOLATION || ec.value() == ERROR_ACCESS_DENIED)) {
+                Sleep(50);
+            }
+        }
+
+        LOG_MANIFEST_WARN("CopyManifestToDepotcache: failed to copy manifest '{}' ({})",
+                          src.filename().string(), ec.message());
+        return false;
+    }
+
     static std::vector<std::string> CollectLuaFiles(const std::string& directory) {
         std::vector<std::string> files;
 
         std::error_code ec;
-        if (!std::filesystem::exists(directory, ec))
-            std::filesystem::create_directories(directory, ec);
         if (!std::filesystem::exists(directory, ec) || !std::filesystem::is_directory(directory, ec))
             return files;
 
-        for (const auto& entry : std::filesystem::directory_iterator(directory, ec)) {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(
+                 directory, std::filesystem::directory_options::skip_permission_denied, ec)) {
             if (ec) break;
-            if (!entry.is_regular_file()) continue;
-            if (entry.path().extension() != ".lua") continue;
-            files.push_back(entry.path().string());
+            if (!entry.is_regular_file(ec)) continue;
+
+            std::string ext = entry.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            });
+            if (ext != ".lua") continue;
+
+            files.push_back(entry.path().lexically_normal().string());
         }
+        std::sort(files.begin(), files.end());
         return files;
     }
 
     // ── single-file parser ──────────────────────────────────────
-    void ParseFile(const std::string& filePath) {
+    void ParseFile(const std::string& rawFilePath) {
         if (!Initialize()) return;
+
+        std::string filePath = std::filesystem::path(rawFilePath).lexically_normal().string();
 
         // Remove old entries from this file before re-parsing.
         UnloadFile(filePath);
@@ -783,6 +1080,8 @@ namespace LuaConfig{
     void ParseDirectory(const std::string& directory) {
         if (!Initialize()) return;
 
+        SyncManifests(directory);
+
         for (const auto& filePath : CollectLuaFiles(directory)) {
             ParseFile(filePath);
         }
@@ -794,6 +1093,10 @@ namespace LuaConfig{
 
     void ReloadDirectories(const std::vector<std::string>& directories, bool clearPendingAdditions) {
         if (!Initialize()) return;
+
+        for (const auto& directory : directories) {
+            SyncManifests(directory);
+        }
 
         std::unordered_set<std::string> activeFiles;
         std::vector<std::string> orderedFiles;
