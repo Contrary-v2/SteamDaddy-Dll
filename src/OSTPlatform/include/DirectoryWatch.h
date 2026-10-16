@@ -44,13 +44,13 @@ namespace OSTPlatform::DirectoryWatch {
         Watch(const Watch&) = delete;
         Watch& operator=(const Watch&) = delete;
 
-        bool Open(const std::string& directory, uint32_t bufferSize);
+        [[nodiscard]] bool Open(const std::string& directory, uint32_t bufferSize, bool watchSubtree = false);
         bool IssueRead();
-        std::vector<Change> Drain();
+        [[nodiscard]] std::vector<Change> Drain();
         void Cancel();
 
-        bool IsOpen() const;
-        const std::string& Directory() const;
+        [[nodiscard]] bool IsOpen() const;
+        [[nodiscard]] const std::string& Directory() const;
 
     private:
         struct Impl;
@@ -59,6 +59,6 @@ namespace OSTPlatform::DirectoryWatch {
         friend WaitResult WaitAny(std::span<Watch*> watches, uint32_t timeoutMs);
     };
 
-    WaitResult WaitAny(std::span<Watch*> watches, uint32_t timeoutMs);
+    [[nodiscard]] WaitResult WaitAny(std::span<Watch*> watches, uint32_t timeoutMs);
 
 } // namespace OSTPlatform::DirectoryWatch

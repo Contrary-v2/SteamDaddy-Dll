@@ -34,16 +34,26 @@ struct Watch::Impl {
     OVERLAPPED overlapped{};
     std::vector<char> buffer;
     bool readPending = false;
+    bool watchSubtree = false;
+
+    ~Impl() {
+        Close();
+    }
 
     void Close() {
         if (dir) {
-            CancelIo(dir.get());
+            if (readPending) {
+                ::CancelIoEx(dir.get(), &overlapped);
+                DWORD dummy = 0;
+                ::GetOverlappedResult(dir.get(), &overlapped, &dummy, TRUE);
+            }
         }
         dir.Reset();
         event.Reset();
         overlapped = {};
         buffer.clear();
         readPending = false;
+        watchSubtree = false;
         directory.clear();
     }
 };
@@ -53,8 +63,9 @@ Watch::~Watch() = default;
 Watch::Watch(Watch&&) noexcept = default;
 Watch& Watch::operator=(Watch&&) noexcept = default;
 
-bool Watch::Open(const std::string& directory, uint32_t bufferSize) {
+bool Watch::Open(const std::string& directory, uint32_t bufferSize, bool watchSubtree) {
     impl_->Close();
+    impl_->watchSubtree = watchSubtree;
 
     impl_->event.Reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
     if (!impl_->event) {
@@ -94,12 +105,15 @@ bool Watch::IssueRead() {
     impl_->overlapped.hEvent = event;
 
     DWORD dummy = 0;
+    DWORD notifyFilter = FILE_NOTIFY_CHANGE_FILE_NAME |
+                         FILE_NOTIFY_CHANGE_DIR_NAME |
+                         FILE_NOTIFY_CHANGE_LAST_WRITE;
     if (!ReadDirectoryChangesW(
             impl_->dir.get(),
             impl_->buffer.data(),
             static_cast<DWORD>(impl_->buffer.size()),
-            FALSE,
-            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE,
+            impl_->watchSubtree ? TRUE : FALSE,
+            notifyFilter,
             &dummy,
             &impl_->overlapped,
             nullptr)) {
@@ -120,26 +134,41 @@ std::vector<Change> Watch::Drain() {
     if (!IsOpen() || !impl_->readPending) return changes;
 
     DWORD bytesReturned = 0;
-    if (!GetOverlappedResult(impl_->dir.get(), &impl_->overlapped, &bytesReturned, FALSE) ||
-        bytesReturned == 0) {
+    if (!GetOverlappedResult(impl_->dir.get(), &impl_->overlapped, &bytesReturned, FALSE)) {
+        if (GetLastError() == ERROR_IO_INCOMPLETE) {
+            return changes;
+        }
         impl_->readPending = false;
         return changes;
     }
 
     impl_->readPending = false;
-    const FILE_NOTIFY_INFORMATION* info =
-        reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(impl_->buffer.data());
+    if (bytesReturned == 0) {
+        OSTP_LOG_WARN("DirectoryWatch: buffer overflow or zero bytes returned for '{}'", impl_->directory);
+        return changes;
+    }
+    const char* bufStart = impl_->buffer.data();
+    const char* bufEnd = bufStart + bytesReturned;
+    const char* current = bufStart;
 
-    while (info) {
-        std::wstring_view fileName(info->FileName, info->FileNameLength / sizeof(wchar_t));
+    while (current + sizeof(FILE_NOTIFY_INFORMATION) <= bufEnd) {
+        const auto* info = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(current);
+        const char* nameStart = reinterpret_cast<const char*>(info->FileName);
+        const size_t nameBytes = info->FileNameLength;
+        if (nameStart + nameBytes > bufEnd) {
+            break;
+        }
+
+        std::wstring_view fileName(info->FileName, nameBytes / sizeof(wchar_t));
         std::string relativePath = Encoding::WideToUtf8(fileName);
         if (!relativePath.empty()) {
             changes.push_back({std::move(relativePath), FromWindowsAction(info->Action)});
         }
 
         if (info->NextEntryOffset == 0) break;
-        info = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(
-            reinterpret_cast<const char*>(info) + info->NextEntryOffset);
+        const char* nextPtr = current + info->NextEntryOffset;
+        if (nextPtr <= current || nextPtr >= bufEnd) break;
+        current = nextPtr;
     }
 
     return changes;
@@ -170,7 +199,10 @@ WaitResult WaitAny(std::span<Watch*> watches, uint32_t timeoutMs) {
         originalIndexes.push_back(i);
     }
 
-    if (events.empty()) {
+    if (events.empty() || events.size() > MAXIMUM_WAIT_OBJECTS) {
+        if (events.size() > MAXIMUM_WAIT_OBJECTS) {
+            OSTP_LOG_WARN("DirectoryWatch::WaitAny: events count {} exceeds MAXIMUM_WAIT_OBJECTS (64)", events.size());
+        }
         return {WaitStatus::Failed, 0};
     }
 
