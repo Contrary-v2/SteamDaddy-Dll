@@ -6,6 +6,20 @@
 
 #include "Types.h"
 
+// Persona state (online status)
+enum EPersonaState : int
+{
+	k_EPersonaStateOffline = 0,			// friend is not currently logged on
+	k_EPersonaStateOnline = 1,			// friend is logged on
+	k_EPersonaStateBusy = 2,			// user is busy
+	k_EPersonaStateAway = 3,			// auto or manually set to away
+	k_EPersonaStateSnooze = 4,			// auto snoozed due to inactivity
+	k_EPersonaStateLookingToTrade = 5,	// user is looking to trade
+	k_EPersonaStateLookingToPlay = 6,	// user is looking to play
+	k_EPersonaStateInvisible = 7,		// user is invisible to friends
+	k_EPersonaStateMax,
+};
+
 enum class BillingType
 {
 	NoCost = 0,
@@ -84,6 +98,28 @@ enum EAppOwnershipFlags
 	k_EAppOwnershipFlags_InvalidOSType		= 0x100000,	// app not supported on current OS version, used to indicate a game is 32-bit on post-catalina. Currently it's own flag so the library will display a notice.
 	k_EAppOwnershipFlags_TimedTrial			= 0x200000,	// App is playable only for limited time
 };
+
+[[nodiscard]] inline constexpr EAppOwnershipFlags operator|(EAppOwnershipFlags a, EAppOwnershipFlags b) noexcept {
+	return static_cast<EAppOwnershipFlags>(static_cast<uint32>(a) | static_cast<uint32>(b));
+}
+[[nodiscard]] inline constexpr EAppOwnershipFlags operator&(EAppOwnershipFlags a, EAppOwnershipFlags b) noexcept {
+	return static_cast<EAppOwnershipFlags>(static_cast<uint32>(a) & static_cast<uint32>(b));
+}
+[[nodiscard]] inline constexpr EAppOwnershipFlags operator~(EAppOwnershipFlags a) noexcept {
+	return static_cast<EAppOwnershipFlags>(~static_cast<uint32>(a));
+}
+[[nodiscard]] inline constexpr EAppOwnershipFlags operator^(EAppOwnershipFlags a, EAppOwnershipFlags b) noexcept {
+	return static_cast<EAppOwnershipFlags>(static_cast<uint32>(a) ^ static_cast<uint32>(b));
+}
+inline constexpr EAppOwnershipFlags& operator|=(EAppOwnershipFlags& a, EAppOwnershipFlags b) noexcept {
+	return a = a | b;
+}
+inline constexpr EAppOwnershipFlags& operator&=(EAppOwnershipFlags& a, EAppOwnershipFlags b) noexcept {
+	return a = a & b;
+}
+inline constexpr EAppOwnershipFlags& operator^=(EAppOwnershipFlags& a, EAppOwnershipFlags b) noexcept {
+	return a = a ^ b;
+}
 
 enum class EGameIDType
 {
@@ -222,7 +258,8 @@ enum EResult
 	k_EResultInsufficientBattery = 124,			// user device doesn't have enough battery charge currently to complete the action
 	k_EResultChargerRequired = 125,				// The operation requires a charger to be plugged in, which wasn't present
 	k_EResultCachedCredentialInvalid = 126,		// Cached credential was invalid - user must reauthenticate
-	K_EResultPhoneNumberIsVOIP = 127,			// The phone number provided is a Voice Over IP number
+	k_EResultPhoneNumberIsVOIP = 127,			// The phone number provided is a Voice Over IP number
+	K_EResultPhoneNumberIsVOIP = k_EResultPhoneNumberIsVOIP, // Backward-compatibility alias
 	k_EResultNotSupported = 128,				// The data being accessed is not supported by this API
 	k_EResultFamilySizeLimitExceeded = 129,		// Reached the maximum size of the family
 	k_EResultOfflineAppCacheInvalid = 130,		// The local data for the offline mode cache is insufficient to login
