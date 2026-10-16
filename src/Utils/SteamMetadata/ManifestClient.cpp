@@ -5,6 +5,7 @@
 #include "Utils/Logging/Log.h"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <mutex>
 #include <string_view>
@@ -40,65 +41,82 @@ namespace ManifestClient {
 
     struct Provider {
         std::string_view name;          // matches [manifest] url = "..."
-        const char*      urlTemplate;   // full literal with one %llu — for log & path
+        const char*      urlTemplate;   // full literal with one %llu (gid-only)
+                                        // or two %llu (depotId, gid) when needsDepot
         Parser           parse;
+        bool             needsDepot;
+        const wchar_t*   headers;        // extra request headers (e.g. UA gate), or nullptr
     };
 
-    consteval Provider Make(std::string_view name, const char* url, Parser parse) {
-        return {name, url, parse};
+    consteval Provider Make(std::string_view name, const char* url, Parser parse,
+                            bool needsDepot = false, const wchar_t* headers = nullptr) {
+        return {name, url, parse, needsDepot, headers};
     }
 
     static constexpr Provider kProviders[] = {
-        Make("opensteamtool", "https://manifest.opensteamtool.com/%llu",       ParsePlainUint),
-        Make("wudrm",         "http://gmrc.wudrm.com/manifest/%llu",           ParsePlainUint),
-        Make("steamrun",      "https://manifest.steam.run/api/manifest/%llu",  ParseSteamRunJson),
+        Make("20770407",    "https://20770407.xyz/manifest/%llu/%llu",   ParsePlainUint, true),
+        Make("wudrm",         "http://gmrc.wudrm.com/manifest/%llu",     ParsePlainUint),
+        Make("opensteamtool", "https://manifest.opensteamtool.com/%llu", ParsePlainUint),
+        Make("steamrun",      "https://manifest.steam.run/api/manifest/%llu", ParseSteamRunJson),
+        Make("manifestdex",   "https://manifest.manifestdex.com/%llu",   ParsePlainUint, false,
+             L"User-Agent: ManifestDeX/1.0"),
+        Make("SDM",           "https://steamapi.993499094.xyz/manifest/%llu/%llu", ParsePlainUint, true),
     };
 
-    static const Provider* g_active = &kProviders[0];   // opensteamtool
-    static std::mutex      g_mutex;
+    static std::atomic<const Provider*> g_active{&kProviders[0]};   // 20770407
+    // Lua 取码函数共用全局 Lua 状态，串行调用；HTTP 请求无锁并发执行
+    static std::mutex g_luaMutex;
 
     bool SetProvider(std::string_view name) {
-        std::lock_guard<std::mutex> lock(g_mutex);
         for (const auto& p : kProviders)
-            if (p.name == name) { 
-                g_active = &p; 
-                return true; 
+            if (p.name == name) {
+                g_active.store(&p, std::memory_order_release);
+                return true;
             }
         return false;
     }
 
     const char* ActiveProviderName() {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        return g_active->name.data(); 
+        const auto* p = g_active.load(std::memory_order_acquire);
+        return p ? p->name.data() : "";
     }
 
     // ── request ───────────────────────────────────────────────────
 
     void Shutdown() {
-        std::lock_guard<std::mutex> lock(g_mutex);
     }
 
     // ── fetch ─────────────────────────────────────────────────────
 
-    static bool FetchActive(uint64_t gid, uint64_t* outCode) {
-        const Provider& p = *g_active;
+    static bool FetchActive(uint64_t gid, uint64_t* outCode, AppId_t depotId = 0) {
+        const auto* active = g_active.load(std::memory_order_acquire);
+        if (!active) return false;
+        const Provider& p = *active;
         const Config::ManifestTimeouts timeouts = Config::GetManifestTimeouts();
 
         char urlLog[256];
-        std::snprintf(urlLog, sizeof(urlLog), p.urlTemplate, gid);
+        if (p.needsDepot) {
+            if (!depotId) return false;
+            std::snprintf(urlLog, sizeof(urlLog), p.urlTemplate,
+                          static_cast<unsigned long long>(depotId),
+                          static_cast<unsigned long long>(gid));
+        } else {
+            std::snprintf(urlLog, sizeof(urlLog), p.urlTemplate,
+                          static_cast<unsigned long long>(gid));
+        }
 
         auto r = OSTPlatform::Http::Execute(
             L"GET",
             urlLog,
             nullptr,
             0,
-            nullptr,
+            p.headers,
             timeouts.resolve,
             timeouts.connect,
             timeouts.send,
             timeouts.recv);
 
-        LOG_MANIFEST_INFO("Manifest {} status={} gid={}", p.name, r.status, gid);
+        LOG_MANIFEST_INFO("Manifest {} status={} depot={} gid={}", p.name, r.status, depotId, gid);
 
         if (!r.ok || r.status != 200) return false;
         return p.parse(r.body, outCode);
@@ -109,9 +127,8 @@ namespace ManifestClient {
     bool FetchManifestRequestCode(uint64_t manifestGid, uint64_t* outRequestCode,
                                   AppId_t appId, AppId_t depotId)
     {
-        std::lock_guard<std::mutex> lock(g_mutex);
-
         if (appId && depotId && LuaConfig::HasManifestCodeFuncEx()) {
+            std::lock_guard<std::mutex> lock(g_luaMutex);
             if (LuaConfig::CallManifestFetchCodeEx(appId, depotId, manifestGid, outRequestCode)) {
                 LOG_MANIFEST_INFO("Manifest gid={} resolved via fetch_manifest_code_ex", manifestGid);
                 return true;
@@ -120,6 +137,7 @@ namespace ManifestClient {
         }
 
         if (LuaConfig::HasManifestCodeFunc()) {
+            std::lock_guard<std::mutex> lock(g_luaMutex);
             if (LuaConfig::CallManifestFetchCode(manifestGid, outRequestCode)) {
                 LOG_MANIFEST_INFO("Manifest gid={} resolved via manifest.lua", manifestGid);
                 return true;
@@ -127,6 +145,6 @@ namespace ManifestClient {
             LOG_MANIFEST_WARN("Manifest gid={} lua returned nil, falling back to config", manifestGid);
         }
 
-        return FetchActive(manifestGid, outRequestCode);
+        return FetchActive(manifestGid, outRequestCode, depotId);
     }
 }
