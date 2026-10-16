@@ -4,15 +4,22 @@
 #include "include/Log.h"
 #include "include/Numbers.h"
 
+#include "Windows/Handles.h"
 #include <windows.h>
 #include <winhttp.h>
 
 #include <chrono>
 #include <format>
+#include <memory>
 #include <string>
+#include <string_view>
 
 namespace OSTPlatform::Http {
 namespace {
+
+struct GlobalFreeDeleter {
+    void operator()(void* p) const noexcept { if (p) ::GlobalFree(p); }
+};
 
 struct ParsedUrl {
     std::wstring host;
@@ -22,35 +29,33 @@ struct ParsedUrl {
     bool valid = false;
 };
 
-ParsedUrl ParseUrl(const char* rawUrl) {
+ParsedUrl ParseUrl(std::string_view url) {
     ParsedUrl out;
-    if (!rawUrl) return out;
+    if (url.empty()) return out;
 
-    std::string url(rawUrl);
     if (url.starts_with("https://")) {
         out.tls = true;
         out.port = INTERNET_DEFAULT_HTTPS_PORT;
-        url = url.substr(8);
+        url.remove_prefix(8);
     } else if (url.starts_with("http://")) {
-        url = url.substr(7);
+        url.remove_prefix(7);
     } else {
         return out;
     }
 
     const size_t slash = url.find('/');
-    const std::string hostPart = url.substr(0, slash);
-    out.path = (slash != std::string::npos)
-        ? L"/" + std::wstring(url.begin() + slash + 1, url.end())
-        : L"/";
+    const std::string_view hostPart = url.substr(0, slash);
+    const std::string_view pathPart = (slash != std::string_view::npos) ? url.substr(slash) : std::string_view("/");
+    out.path = Encoding::Utf8ToWide(pathPart);
 
     const size_t colon = hostPart.find(':');
-    if (colon != std::string::npos) {
-        out.host = std::wstring(hostPart.begin(), hostPart.begin() + colon);
-        const auto port = Numbers::ParseUInt32(hostPart, {colon + 1});
+    if (colon != std::string_view::npos) {
+        out.host = Encoding::Utf8ToWide(hostPart.substr(0, colon));
+        const auto port = Numbers::ParseUInt32(hostPart.substr(colon + 1));
         if (!port || *port == 0 || *port > 65535) return out;
         out.port = static_cast<INTERNET_PORT>(*port);
     } else {
-        out.host = std::wstring(hostPart.begin(), hostPart.end());
+        out.host = Encoding::Utf8ToWide(hostPart);
     }
 
     out.valid = !out.host.empty();
@@ -67,10 +72,11 @@ Result Execute(const wchar_t* method,
                uint32_t timeoutResolve,
                uint32_t timeoutConnect,
                uint32_t timeoutSend,
-               uint32_t timeoutRecv) {
+               uint32_t timeoutRecv,
+               size_t maxResponseBytes) {
     Result r;
 
-    ParsedUrl pu = ParseUrl(url);
+    ParsedUrl pu = ParseUrl(url ? std::string_view(url) : std::string_view{});
     if (!pu.valid) {
         OSTP_LOG_WARN("Invalid URL: {}", url ? url : "");
         return r;
@@ -78,48 +84,64 @@ Result Execute(const wchar_t* method,
 
     auto t0 = std::chrono::steady_clock::now();
 
-    HINTERNET hSession = WinHttpOpen(L"OpenSteamTool/1.0",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS,
-        0);
+    WINHTTP_CURRENT_USER_IE_PROXY_CONFIG ieProxy{};
+    const BOOL hasIeProxy = WinHttpGetIEProxyConfigForCurrentUser(&ieProxy);
+
+    std::unique_ptr<WCHAR, GlobalFreeDeleter> autoProxy(hasIeProxy ? ieProxy.lpszProxy : nullptr);
+    std::unique_ptr<WCHAR, GlobalFreeDeleter> autoBypass(hasIeProxy ? ieProxy.lpszProxyBypass : nullptr);
+    std::unique_ptr<WCHAR, GlobalFreeDeleter> autoConfigUrl(hasIeProxy ? ieProxy.lpszAutoConfigUrl : nullptr);
+
+    DWORD accessType = WINHTTP_ACCESS_TYPE_DEFAULT_PROXY;
+    const WCHAR* proxyName = WINHTTP_NO_PROXY_NAME;
+    const WCHAR* proxyBypass = WINHTTP_NO_PROXY_BYPASS;
+
+    if (autoProxy && autoProxy.get()[0] != L'\0') {
+        accessType = WINHTTP_ACCESS_TYPE_NAMED_PROXY;
+        proxyName = autoProxy.get();
+        if (autoBypass && autoBypass.get()[0] != L'\0') {
+            proxyBypass = autoBypass.get();
+        }
+    }
+
+    Windows::UniqueWinHttpHandle hSession(WinHttpOpen(L"OpenSteamTool/1.0",
+        accessType,
+        proxyName,
+        proxyBypass,
+        0));
     if (!hSession) {
         OSTP_LOG_WARN("{} - WinHttpOpen failed (error={})", url ? url : "", GetLastError());
         return r;
     }
 
-    WinHttpSetTimeouts(hSession, timeoutResolve, timeoutConnect, timeoutSend, timeoutRecv);
+    WinHttpSetTimeouts(hSession.get(), timeoutResolve, timeoutConnect, timeoutSend, timeoutRecv);
 
-    HINTERNET hConnect = WinHttpConnect(hSession, pu.host.c_str(), pu.port, 0);
+    Windows::UniqueWinHttpHandle hConnect(WinHttpConnect(hSession.get(), pu.host.c_str(), pu.port, 0));
     if (!hConnect) {
         OSTP_LOG_WARN("{} - WinHttpConnect(host='{}', port={}) failed (error={})",
                       url ? url : "",
                       Encoding::WideToUtf8(pu.host),
                       pu.port,
                       GetLastError());
-        WinHttpCloseHandle(hSession);
         return r;
     }
 
     const DWORD flags = pu.tls ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET hRequest = WinHttpOpenRequest(
-        hConnect,
+    Windows::UniqueWinHttpHandle hRequest(WinHttpOpenRequest(
+        hConnect.get(),
         method,
         pu.path.c_str(),
         nullptr,
         WINHTTP_NO_REFERER,
         WINHTTP_DEFAULT_ACCEPT_TYPES,
-        flags);
+        flags));
     if (!hRequest) {
         OSTP_LOG_WARN("{} - WinHttpOpenRequest failed (error={})", url ? url : "", GetLastError());
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
         return r;
     }
 
     if (headers && headers[0]) {
         if (!WinHttpAddRequestHeaders(
-            hRequest,
+            hRequest.get(),
             headers,
             static_cast<DWORD>(wcslen(headers)),
             WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE)) {
@@ -128,15 +150,15 @@ Result Execute(const wchar_t* method,
     }
 
     const DWORD totalLen = reqBodyLen;
-    if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+    if (!WinHttpSendRequest(hRequest.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0,
             const_cast<void*>(reqBody), reqBodyLen, totalLen, 0)) {
-        OSTP_LOG_WARN("{} - WinHttpSendRequest failed (error={})", url, GetLastError());
-    } else if (!WinHttpReceiveResponse(hRequest, nullptr)) {
-        OSTP_LOG_WARN("{} - WinHttpReceiveResponse failed (error={})", url, GetLastError());
+        OSTP_LOG_WARN("{} - WinHttpSendRequest failed (error={})", url ? url : "", GetLastError());
+    } else if (!WinHttpReceiveResponse(hRequest.get(), nullptr)) {
+        OSTP_LOG_WARN("{} - WinHttpReceiveResponse failed (error={})", url ? url : "", GetLastError());
     } else {
         DWORD sz = sizeof(r.status);
         if (!WinHttpQueryHeaders(
-            hRequest,
+            hRequest.get(),
             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
             WINHTTP_HEADER_NAME_BY_INDEX,
             &r.status,
@@ -147,7 +169,7 @@ Result Execute(const wchar_t* method,
 
         DWORD avail = 0;
         while (true) {
-            if (!WinHttpQueryDataAvailable(hRequest, &avail)) {
+            if (!WinHttpQueryDataAvailable(hRequest.get(), &avail)) {
                 OSTP_LOG_WARN("{} - WinHttpQueryDataAvailable failed (error={})", url ? url : "", GetLastError());
                 break;
             }
@@ -156,19 +178,24 @@ Result Execute(const wchar_t* method,
             const size_t off = r.body.size();
             r.body.resize(off + avail);
             DWORD read = 0;
-            if (!WinHttpReadData(hRequest, r.body.data() + off, avail, &read)) {
+            if (!WinHttpReadData(hRequest.get(), r.body.data() + off, avail, &read)) {
                 OSTP_LOG_WARN("{} - WinHttpReadData(size={}) failed (error={})",
                               url ? url : "", avail, GetLastError());
                 r.body.resize(off);
                 break;
             }
             r.body.resize(off + read);
-            if (r.body.size() > 256 * 1024) break;
+            if (r.body.size() > maxResponseBytes) {
+                OSTP_LOG_WARN("{} - response body exceeded cap of {} bytes, truncating",
+                              url ? url : "", maxResponseBytes);
+                r.body.resize(maxResponseBytes);
+                break;
+            }
         }
 
         if (r.status < 200 || r.status >= 300) {
             OSTP_LOG_WARN("{} - unexpected HTTP {}  body={}",
-                             url,
+                             url ? url : "",
                              r.status,
                              r.body.size() > 512 ? r.body.substr(0, 512) + "..." : r.body);
         } else {
@@ -177,10 +204,6 @@ Result Execute(const wchar_t* method,
         }
         r.ok = true;
     }
-
-    WinHttpCloseHandle(hRequest);
-    WinHttpCloseHandle(hConnect);
-    WinHttpCloseHandle(hSession);
 
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
