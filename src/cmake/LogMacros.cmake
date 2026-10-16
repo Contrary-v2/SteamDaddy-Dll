@@ -7,22 +7,25 @@
 set(_log_modules_h "${CMAKE_CURRENT_SOURCE_DIR}/Utils/Logging/LogModules.def")
 set(_log_macros_out "${CMAKE_CURRENT_BINARY_DIR}/generated/ost_log_macros.h")
 
-file(STRINGS "${_log_modules_h}" _lines REGEX "^OST_MOD\\(")
-string(REGEX MATCHALL "OST_MOD\\([A-Za-z_][A-Za-z0-9_]*" _matches "${_lines}")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+
+file(STRINGS "${_log_modules_h}" _lines REGEX "^[ \t]*OST_MOD\\(")
+string(REGEX MATCHALL "OST_MOD\\([ \t]*[A-Za-z_][A-Za-z0-9_]*" _matches "${_lines}")
 
 set(_debug "")
 set(_release "")
 
 foreach(_m ${_matches})
-    string(REGEX REPLACE "OST_MOD\\(" "" _var "${_m}")
+    string(REGEX REPLACE "^OST_MOD\\([ \t]*" "" _var "${_m}")
+    string(STRIP "${_var}" _var)
     string(TOUPPER "${_var}" _upper)
 
     string(APPEND _debug
-"#define LOG_${_upper}_TRACE(...)  SPDLOG_LOGGER_TRACE(Log::${_var}, __VA_ARGS__)\n\
-#define LOG_${_upper}_DEBUG(...)  SPDLOG_LOGGER_DEBUG(Log::${_var}, __VA_ARGS__)\n\
-#define LOG_${_upper}_INFO(...)   SPDLOG_LOGGER_INFO(Log::${_var}, __VA_ARGS__)\n\
-#define LOG_${_upper}_WARN(...)   SPDLOG_LOGGER_WARN(Log::${_var}, __VA_ARGS__)\n\
-#define LOG_${_upper}_ERROR(...)  SPDLOG_LOGGER_ERROR(Log::${_var}, __VA_ARGS__)\n\n")
+"#define LOG_${_upper}_TRACE(...)  do { if (Log::${_var} && Log::${_var}->should_log(spdlog::level::trace)) SPDLOG_LOGGER_TRACE(Log::${_var}, __VA_ARGS__); } while (0)\n\
+#define LOG_${_upper}_DEBUG(...)  do { if (Log::${_var} && Log::${_var}->should_log(spdlog::level::debug)) SPDLOG_LOGGER_DEBUG(Log::${_var}, __VA_ARGS__); } while (0)\n\
+#define LOG_${_upper}_INFO(...)   do { if (Log::${_var} && Log::${_var}->should_log(spdlog::level::info))  SPDLOG_LOGGER_INFO(Log::${_var}, __VA_ARGS__); } while (0)\n\
+#define LOG_${_upper}_WARN(...)   do { if (Log::${_var} && Log::${_var}->should_log(spdlog::level::warn))  SPDLOG_LOGGER_WARN(Log::${_var}, __VA_ARGS__); } while (0)\n\
+#define LOG_${_upper}_ERROR(...)  do { if (Log::${_var} && Log::${_var}->should_log(spdlog::level::err))   SPDLOG_LOGGER_ERROR(Log::${_var}, __VA_ARGS__); } while (0)\n\n")
 
     string(APPEND _release
 "#define LOG_${_upper}_TRACE(...)  ((void)0)\n\
@@ -35,7 +38,7 @@ endforeach()
 set(_new_content
 "// Auto-generated from LogModules.def -- DO NOT EDIT\n\
 #pragma once\n\n\
-#ifdef OPENSTEAMTOOL_LOGGING_ENABLED\n\n\
+#ifdef STEAMDADDY_LOGGING_ENABLED\n\n\
 ${_debug}\
 #else\n\n\
 ${_release}\

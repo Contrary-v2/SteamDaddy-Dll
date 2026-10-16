@@ -35,8 +35,8 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
 FetchContent_MakeAvailable(protobuf)
 set(CMAKE_WARN_DEPRECATED ${_saved_CMAKE_WARN_DEPRECATED} CACHE BOOL "" FORCE)
 
-# Silence warnings in protobuf source.
-foreach(_t IN ITEMS libprotobuf libprotobuf-lite libprotoc)
+# Silence warnings in protobuf source and host compiler toolchain.
+foreach(_t IN ITEMS libprotobuf libprotobuf-lite libprotoc protoc)
     if(TARGET ${_t})
         if(MSVC)
             target_compile_options(${_t} PRIVATE /w)
