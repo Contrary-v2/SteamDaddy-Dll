@@ -22,12 +22,23 @@ std::string WidePathToUtf8(std::wstring_view path, const char* operation) {
 }
 
 std::filesystem::path ModuleFilePath(HMODULE module, const char* operation) {
-    for (DWORD capacity = MAX_PATH; capacity <= kMaxWin32PathBuffer; capacity *= 2) {
+    wchar_t stackBuf[MAX_PATH];
+    ::SetLastError(ERROR_SUCCESS);
+    DWORD len = ::GetModuleFileNameW(module, stackBuf, static_cast<DWORD>(std::size(stackBuf)));
+    if (len == 0) {
+        OSTP_LOG_WARN("{}: GetModuleFileNameW failed (error={})", operation, ::GetLastError());
+        return {};
+    }
+    if (len < static_cast<DWORD>(std::size(stackBuf))) {
+        return std::filesystem::path(std::wstring_view(stackBuf, len));
+    }
+
+    for (DWORD capacity = MAX_PATH * 2; capacity <= kMaxWin32PathBuffer; capacity *= 2) {
         std::vector<wchar_t> buffer(capacity);
-        SetLastError(ERROR_SUCCESS);
-        const DWORD len = GetModuleFileNameW(module, buffer.data(), capacity);
+        ::SetLastError(ERROR_SUCCESS);
+        len = ::GetModuleFileNameW(module, buffer.data(), capacity);
         if (len == 0) {
-            OSTP_LOG_WARN("{}: GetModuleFileNameW failed (error={})", operation, GetLastError());
+            OSTP_LOG_WARN("{}: GetModuleFileNameW failed (error={})", operation, ::GetLastError());
             return {};
         }
         if (len < capacity) {
@@ -40,11 +51,22 @@ std::filesystem::path ModuleFilePath(HMODULE module, const char* operation) {
 }
 
 std::string DirectoryFromQuery(DWORD (*query)(DWORD, wchar_t*), const char* operation) {
-    for (DWORD capacity = MAX_PATH; capacity <= kMaxWin32PathBuffer; capacity *= 2) {
+    wchar_t stackBuf[MAX_PATH];
+    DWORD len = query(static_cast<DWORD>(std::size(stackBuf)), stackBuf);
+    if (len == 0) {
+        OSTP_LOG_WARN("{} failed (error={})", operation, ::GetLastError());
+        return {};
+    }
+    if (len < static_cast<DWORD>(std::size(stackBuf))) {
+        return WidePathToUtf8(std::wstring_view(stackBuf, len), operation);
+    }
+
+    DWORD capacity = (len > MAX_PATH) ? len + 1 : MAX_PATH * 2;
+    for (; capacity <= kMaxWin32PathBuffer; capacity *= 2) {
         std::vector<wchar_t> buffer(capacity);
-        const DWORD len = query(capacity, buffer.data());
+        len = query(capacity, buffer.data());
         if (len == 0) {
-            OSTP_LOG_WARN("{} failed (error={})", operation, GetLastError());
+            OSTP_LOG_WARN("{} failed (error={})", operation, ::GetLastError());
             return {};
         }
         if (len < capacity) {
@@ -60,21 +82,35 @@ std::string DirectoryFromQuery(DWORD (*query)(DWORD, wchar_t*), const char* oper
 }
 
 DWORD GetCurrentDirectoryThunk(DWORD capacity, wchar_t* buffer) {
-    return GetCurrentDirectoryW(capacity, buffer);
+    return ::GetCurrentDirectoryW(capacity, buffer);
 }
 
 DWORD GetSystemDirectoryThunk(DWORD capacity, wchar_t* buffer) {
-    return GetSystemDirectoryW(buffer, capacity);
+    return ::GetSystemDirectoryW(buffer, capacity);
 }
 
 } // namespace
 
 ModuleHandle Load(const std::filesystem::path& path) {
-    ModuleHandle module = reinterpret_cast<ModuleHandle>(LoadLibraryW(path.wstring().c_str()));
+    ModuleHandle module = reinterpret_cast<ModuleHandle>(::LoadLibraryW(path.c_str()));
     if (!module) {
-        OSTP_LOG_WARN("LoadLibraryW('{}') failed (error={})", path.string(), GetLastError());
+        const DWORD err = ::GetLastError();
+        OSTP_LOG_WARN("LoadLibraryW('{}') failed (error={})", Encoding::PathToUtf8(path), err);
+        ::SetLastError(err);
     }
     return module;
+}
+
+bool Unload(ModuleHandle module) {
+    if (!module) return false;
+    const BOOL ok = ::FreeLibrary(reinterpret_cast<HMODULE>(module));
+    if (!ok) {
+        const DWORD err = ::GetLastError();
+        OSTP_LOG_WARN("FreeLibrary({:p}) failed (error={})", module, err);
+        ::SetLastError(err);
+        return false;
+    }
+    return true;
 }
 
 ModuleHandle GetLoaded(std::string_view moduleName) {
@@ -83,29 +119,33 @@ ModuleHandle GetLoaded(std::string_view moduleName) {
         OSTP_LOG_DEBUG("GetLoaded('{}'): module name conversion failed", moduleName);
         return nullptr;
     }
-    return reinterpret_cast<ModuleHandle>(GetModuleHandleW(wideName.c_str()));
+    return reinterpret_cast<ModuleHandle>(::GetModuleHandleW(wideName.empty() ? nullptr : wideName.c_str()));
 }
 
 void* GetSymbol(ModuleHandle module, const char* symbolName) {
-    if (!module) return nullptr;
-    void* symbol = reinterpret_cast<void*>(GetProcAddress(reinterpret_cast<HMODULE>(module), symbolName));
+    if (!module || !symbolName) return nullptr;
+    void* symbol = reinterpret_cast<void*>(::GetProcAddress(reinterpret_cast<HMODULE>(module), symbolName));
     if (!symbol) {
-        OSTP_LOG_DEBUG("GetProcAddress('{}') failed (error={})", symbolName ? symbolName : "", GetLastError());
+        const DWORD err = ::GetLastError();
+        OSTP_LOG_DEBUG("GetProcAddress('{}') failed (error={})", symbolName, err);
+        ::SetLastError(err);
     }
     return symbol;
 }
 
 void* GetSymbol(ModuleHandle module, uint16_t ordinal) {
     if (!module) return nullptr;
-    void* symbol = reinterpret_cast<void*>(GetProcAddress(reinterpret_cast<HMODULE>(module), MAKEINTRESOURCEA(ordinal)));
+    void* symbol = reinterpret_cast<void*>(::GetProcAddress(reinterpret_cast<HMODULE>(module), MAKEINTRESOURCEA(ordinal)));
     if (!symbol) {
-        OSTP_LOG_DEBUG("GetProcAddress(ordinal={}) failed (error={})", ordinal, GetLastError());
+        const DWORD err = ::GetLastError();
+        OSTP_LOG_DEBUG("GetProcAddress(ordinal={}) failed (error={})", ordinal, err);
+        ::SetLastError(err);
     }
     return symbol;
 }
 
-uint32_t GetLastErrorCode() {
-    return GetLastError();
+uint32_t GetLastErrorCode() noexcept {
+    return ::GetLastError();
 }
 
 std::string GetCurrentDirectoryPath() {
