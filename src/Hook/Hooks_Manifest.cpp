@@ -1,5 +1,8 @@
 #include "Hooks_Manifest.h"
 #include "HookMacros.h"
+#include "Hook/Hooks_Package.h"
+#include "Utils/Config/Config.h"
+#include "Utils/Config/LuaConfig.h"
 #include "dllmain.h"
 #include <format>
 
@@ -24,42 +27,60 @@ namespace {
         bool result = oBuildDepotDependency(pUserAppMgr, AppId, pUserConfig,
             pDepotInfo, pSharedDepotInfo, pSteamApp, pBuildId, pbBetaFallback);
 
+        if (!result) return result;
+
+        const bool hasPrimary = pDepotInfo && pDepotInfo->m_Size > 0 && pDepotInfo->m_Memory.m_pMemory != nullptr;
+        const bool hasShared  = pSharedDepotInfo && pSharedDepotInfo->m_Size > 0 && pSharedDepotInfo->m_Memory.m_pMemory != nullptr;
+        if (!hasPrimary && !hasShared) return result;
+
+        const auto& overrides = LuaConfig::GetManifestOverrides();
+        if (overrides.empty()) return result;
+
         LOG_MANIFEST_TRACE("BuildDepotDependency: AppId={} pUserConfig=0x{:X} result={} pSteamApp=0x{:X} pBuildId={} pbBetaFallback={}",
             AppId, (uintptr_t)pUserConfig, result, (uintptr_t)pSteamApp,
             pBuildId ? *pBuildId : 0, pbBetaFallback ? *pbBetaFallback : false);
-        if (pDepotInfo) {
+        if (hasPrimary) {
             LOG_MANIFEST_TRACE("pDepotInfo->nCount={}", pDepotInfo->m_Size);
             for (uint32 i = 0; i < pDepotInfo->m_Size; ++i) {
                 LOG_MANIFEST_TRACE("  [{}] {}", i, DepotEntryDebug(pDepotInfo->m_Memory.m_pMemory[i]));
             }
         }
-        if (pSharedDepotInfo) {
+        if (hasShared) {
             LOG_MANIFEST_TRACE("pSharedDepotInfo->nCount={}", pSharedDepotInfo->m_Size);
             for (uint32 i = 0; i < pSharedDepotInfo->m_Size; ++i) {
                 LOG_MANIFEST_TRACE("  shared[{}] {}", i, DepotEntryDebug(pSharedDepotInfo->m_Memory.m_pMemory[i]));
             }
         }
 
-        if (!result) return result;
+        const bool lockOwned = Config::GetManifestLockOwnedGames();
 
-        const auto& overrides = LuaConfig::GetManifestOverrides();
-        if (overrides.empty()) return result;
-
-        if (pDepotInfo && pDepotInfo->m_Size) {
-            for (uint32 i = 0; i < pDepotInfo->m_Size; ++i) {
-                DepotEntry& e = pDepotInfo->m_Memory.m_pMemory[i];
+        auto patchVector = [&](CUtlVector<DepotEntry>* vec, const char* label) {
+            if (!vec || !vec->m_Size || !vec->m_Memory.m_pMemory) return;
+            for (uint32 i = 0; i < vec->m_Size; ++i) {
+                DepotEntry& e = vec->m_Memory.m_pMemory[i];
                 auto it = overrides.find(e.DepotId);
                 if (it != overrides.end()) {
+                    AppId_t targetAppId = (e.DlcAppId != 0) ? e.DlcAppId : (e.AppId != 0 ? e.AppId : AppId);
+                    if (!lockOwned && Hooks_Package::HasValidLicense(targetAppId)) {
+                        LOG_MANIFEST_INFO("BuildDepotDependency: skipping manifest lock for licensed targetAppId={} depot={}",
+                            targetAppId, e.DepotId);
+                        continue;
+                    }
+
                     // if size=0 in the override, keep the original size(affects download display but not the actual download)
                     uint64_t newSize = it->second.size ? it->second.size : e.ManifestSize;
-                    LOG_MANIFEST_INFO("BuildDepotDependency: patching depot {} gid={}->{} size={}->{}",
-                        e.DepotId, e.ManifestGid, it->second.gid,
+                    LOG_MANIFEST_INFO("BuildDepotDependency: patching {} depot {} gid={}->{} size={}->{}",
+                        label, e.DepotId, e.ManifestGid, it->second.gid,
                         e.ManifestSize, newSize);
                     e.ManifestGid  = it->second.gid;
                     e.ManifestSize = newSize;
                 }
             }
-        }
+        };
+
+        patchVector(pDepotInfo, "primary");
+        patchVector(pSharedDepotInfo, "shared");
+
         return result;
     }
 

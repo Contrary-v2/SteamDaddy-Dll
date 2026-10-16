@@ -28,7 +28,7 @@ namespace {
     const char* GetKeyName(int symbol) {
         auto* sys = GetKeyValuesSystem();
         auto name = sys->GetStringForSymbol(symbol);
-        LOG_KEYVALUE_TRACE("GetKeyName: symbol={} -> name={}", symbol, name);
+        LOG_TRACE("GetKeyName: symbol={} -> name={}", symbol, name);
         return name ? name : nullptr;
     }
     
