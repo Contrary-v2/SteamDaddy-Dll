@@ -1,6 +1,7 @@
 #include "Hooks_Package.h"
 #include "HookMacros.h"
 #include "Hooks_SteamUI.h"
+#include "Hooks_Misc.h"
 #include "dllmain.h"
 #include "Utils/HookSupport/VehCommon.h"
 
@@ -110,20 +111,38 @@ namespace {
 
         if (LuaConfig::HasDepot(appId, false)) {
             if (pOwn) {
-                if (result && pOwn->ExistInPackageNums > 1) {
+                bool isTrulyOwned = result && (pOwn->ExistInPackageNums > 1) && !pOwn->bFamilyShared && !pOwn->bBorrowed;
+                if (isTrulyOwned) {
                     // Actually owned — record so HasDepot excludes it going forward
                     LuaConfig::MarkOwned(appId);
                     pOwn->ReleaseState = EAppReleaseState::Released;
                 } else {
-                    pOwn->PackageId    = kInjectedPackageId;
-                    pOwn->ReleaseState = EAppReleaseState::Released;
-                    pOwn->bOwnsLicense = true; // This forces DLCs on steam family shared games that u dont own when adding their appid via .lua
-                    pOwn->bFreeLicense = false;
+                    pOwn->PackageId         = kInjectedPackageId;
+                    pOwn->ReleaseState      = EAppReleaseState::Released;
+                    pOwn->bOwnsLicense      = true; // This forces DLCs and enables decoupled family shared games
+                    pOwn->bFreeLicense      = false;
+                    pOwn->bFamilyShared     = false;
+                    pOwn->bBorrowed         = false;
+                    pOwn->bLicenseLocked    = false;
+                    pOwn->bIsPermanent      = true;
+                    pOwn->bLicensePermanent = true;
+                    const AccountID_t activeId = Hooks_Misc::GetActiveAccountID();
+                    pOwn->SteamId32         = activeId ? activeId : 0;
                     return true;
                 }
             } else {
                 return true;
             }
+        }
+
+        if (pOwn && (pOwn->bFamilyShared || pOwn->bBorrowed)) {
+            if (pOwn->bLicenseLocked) {
+                LOG_PACKAGE_DEBUG("CheckAppOwnership: Clearing bLicenseLocked for shared AppId={}", appId);
+                pOwn->bLicenseLocked = false;
+            }
+            pOwn->bBorrowed = false;
+            pOwn->bOwnsLicense = true;
+            result = true;
         }
 
         return result;
