@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 
 // Hosts CloudRedirect's prebuilt cloud_redirect.dll inside the Steam process and
 // drives its third-party client API (see CloudRedirect/src/common/cr_api.h):
@@ -17,22 +18,38 @@ namespace CloudRedirectHost {
     // Steam hooks are installed. steamInstallPath is the Steam root directory.
     void Initialize(const char* steamInstallPath);
 
+    // External resolver for active OnlineFix app ID (IoC decoupling)
+    using OnlineFixAppResolver = uint32_t (*)();
+    void SetOnlineFixAppResolver(OnlineFixAppResolver resolver);
+
+    // External license checker (IoC decoupling: checks owned or family-shared licenses)
+    using LicenseChecker = bool (*)(uint32_t appId);
+    void SetLicenseChecker(LicenseChecker checker);
+
     // Re-push the current unlocked-app set to CloudRedirect. Called after a Lua
     // hot-reload so the redirected set tracks addappid() changes.
     void SyncAppSet();
 
     // True once the DLL is loaded and CR_InitCloudSave succeeded.
-    bool IsActive();
+    [[nodiscard]] bool IsActive() noexcept;
 
     // Whether CloudRedirect is currently redirecting saves for this appid.
-    bool IsApp(uint32_t appId);
+    [[nodiscard]] bool IsApp(uint32_t appId);
+
+    // Dynamically register an app (e.g. from -onlinefix spawn) with CloudRedirect.
+    void AddApp(uint32_t appId);
 
     // Bridge from the NetPacket hook: forwards a single Cloud.* RPC to
     // CloudRedirect. Returns false when not handled (caller chains to original).
-    bool HandleCloudRpc(const char* method, uint32_t appId, uint32_t accountId,
-                        const uint8_t* reqBody, uint32_t reqLen,
-                        uint8_t* respBuf, uint32_t respMaxLen,
-                        uint32_t* respLen, int32_t* eresult);
+    [[nodiscard]] bool HandleCloudRpc(const char* method, uint32_t appId, uint32_t accountId,
+                                      std::span<const uint8_t> reqBody,
+                                      std::span<uint8_t> respBuf,
+                                      uint32_t* respLen, int32_t* eresult);
+
+    [[nodiscard]] bool HandleCloudRpc(const char* method, uint32_t appId, uint32_t accountId,
+                                      const uint8_t* reqBody, uint32_t reqLen,
+                                      uint8_t* respBuf, uint32_t respMaxLen,
+                                      uint32_t* respLen, int32_t* eresult);
 
     void SetAccountId(uint32_t accountId);
     void NotifyAppRunning(uint32_t appId, bool running);
@@ -44,7 +61,8 @@ namespace CloudRedirectHost {
         uint32_t unlockTimes[32];
     };
     // Returns number of blocks written (0 if none/disabled).
-    uint32_t GetAchievements(uint32_t appId, AchievementBlock* out, uint32_t maxBlocks);
+    [[nodiscard]] uint32_t GetAchievements(uint32_t appId, std::span<AchievementBlock> outBlocks);
+    [[nodiscard]] uint32_t GetAchievements(uint32_t appId, AchievementBlock* out, uint32_t maxBlocks);
 
     // Teardown. Called from DLL_PROCESS_DETACH.
     void Shutdown();

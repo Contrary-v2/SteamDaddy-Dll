@@ -1,20 +1,24 @@
 #include "CloudRedirectHost.h"
+#include "dllmain.h"
 
 #include "OSTPlatform/include/DynamicLibrary.h"
+#include "OSTPlatform/include/Encoding.h"
 #include "Utils/Config/Config.h"
 #include "Utils/Config/LuaConfig.h"
 #include "Utils/Logging/Log.h"
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace CloudRedirectHost {
 namespace {
 
     // --- CloudRedirect third-party client ABI (CloudRedirect/src/common/cr_api.h)
-    // Declared locally so OpenSteamTool does not need CloudRedirect's headers.
+    // Declared locally so SteamDaddy does not need CloudRedirect's headers.
     using CR_NotifyFn        = void (*)(int level, const char* title, const char* message);
     using CR_InitCloudSave_t = bool (*)(const char* steamPath, CR_NotifyFn notify);
     using CR_HandleCloudRpc_t = bool (*)(const char* method, uint32_t appId, uint32_t accountId,
@@ -33,13 +37,36 @@ namespace {
     using CR_GetAchievements_t    = uint32_t (*)(uint32_t, CloudRedirectHost::AchievementBlock*, uint32_t);
     using CR_InstallVtableHooks_t = bool (*)();
 
-    std::mutex        g_mutex;
-    std::atomic<bool> g_active{false};
+    std::mutex            g_mutex;
+    std::atomic<bool>     g_active{false};
+    std::atomic<uint32_t> g_cachedAccountId{0};
+    std::atomic<uint32_t> g_inFlightCalls{0};
     OSTPlatform::DynamicLibrary::ModuleHandle g_module = nullptr;
+
+    struct InFlightGuard {
+        bool active = false;
+        InFlightGuard() noexcept {
+            if (g_active.load(std::memory_order_acquire)) {
+                g_inFlightCalls.fetch_add(1, std::memory_order_acquire);
+                if (g_active.load(std::memory_order_acquire)) {
+                    active = true;
+                } else {
+                    g_inFlightCalls.fetch_sub(1, std::memory_order_release);
+                }
+            }
+        }
+        ~InFlightGuard() noexcept {
+            if (active) {
+                g_inFlightCalls.fetch_sub(1, std::memory_order_release);
+            }
+        }
+        [[nodiscard]] explicit operator bool() const noexcept { return active; }
+    };
 
     CR_InitCloudSave_t     g_initCloudSave     = nullptr;
     CR_HandleCloudRpc_t    g_handleCloudRpc    = nullptr;
     CR_SetApps_t           g_setApps           = nullptr;
+    CR_AddApp_t            g_addApp            = nullptr;
     CR_IsApp_t             g_isApp             = nullptr;
     CR_Shutdown_t          g_shutdownFn        = nullptr;
     CR_EnableStatsSync_t    g_enableStatsSync    = nullptr;
@@ -49,7 +76,17 @@ namespace {
     CR_GetAchievements_t    g_getAchievements    = nullptr;
     CR_InstallVtableHooks_t g_installVtableHooks = nullptr;
 
-    // Routes CloudRedirect's notifications into OpenSteamTool's log instead of
+    std::atomic<OnlineFixAppResolver> g_onlineFixResolver{nullptr};
+    std::atomic<LicenseChecker> g_licenseChecker{nullptr};
+
+    bool IsAppLicensed(uint32_t appId) {
+        if (const auto checker = g_licenseChecker.load(std::memory_order_relaxed)) {
+            return checker(appId);
+        }
+        return LuaConfig::IsOwned(appId);
+    }
+
+    // Routes CloudRedirect's notifications into SteamDaddy's log instead of
     // popping a MessageBox from inside Steam.
     void CloudNotify(int level, const char* title, const char* message) {
         const char* t = title ? title : "CloudRedirect";
@@ -63,13 +100,26 @@ namespace {
 
     std::filesystem::path ResolveLibraryPath(const std::string& steamRoot,
                                              const std::string& configured) {
-        if (configured.empty())
-            return std::filesystem::path(steamRoot) / "cloud_redirect.dll";
+        using OSTPlatform::Encoding::PathFromUtf8;
+        std::error_code ec;
+        const std::filesystem::path filename = PathFromUtf8(configured.empty() ? "cloud_redirect.dll" : configured);
+        if (filename.is_absolute()) {
+            return filename;
+        }
 
-        std::filesystem::path lib(configured);
-        if (lib.is_absolute())
-            return lib;
-        return std::filesystem::path(steamRoot) / lib;
+        if (DllDir[0] != '\0') {
+            auto p = PathFromUtf8(DllDir) / filename;
+            if (std::filesystem::exists(p, ec) && !ec) return p;
+        }
+        if (ConfigPath[0] != '\0') {
+            auto configParent = PathFromUtf8(ConfigPath).parent_path();
+            auto steamRootPath = PathFromUtf8(steamRoot);
+            if (configParent != steamRootPath) {
+                auto p = configParent / filename;
+                if (std::filesystem::exists(p, ec) && !ec) return p;
+            }
+        }
+        return PathFromUtf8(steamRoot) / filename;
     }
 
     template <typename T>
@@ -81,6 +131,19 @@ namespace {
             return false;
         }
         return true;
+    }
+
+    std::vector<AppId_t> CollectRedirectedAppIds() {
+        std::vector<AppId_t> depots = LuaConfig::GetAllDepotIds();
+        std::erase_if(depots, [](AppId_t id) {
+            return IsAppLicensed(id);
+        });
+        const auto resolver = g_onlineFixResolver.load(std::memory_order_relaxed);
+        const AppId_t fixAppId = resolver ? resolver() : 0;
+        if (fixAppId != 0 && !IsAppLicensed(fixAppId) && std::find(depots.begin(), depots.end(), fixAppId) == depots.end()) {
+            depots.push_back(fixAppId);
+        }
+        return depots;
     }
 
 } // namespace
@@ -100,15 +163,17 @@ void Initialize(const char* steamInstallPath) {
     if (g_active.load(std::memory_order_acquire)) return;
 
     const std::filesystem::path libPath = ResolveLibraryPath(steamInstallPath, cloud.library);
-    if (!std::filesystem::exists(libPath)) {
-        LOG_WARN("CloudRedirect: cloud_redirect.dll not found at {}", libPath.string());
+    const std::string libPathUtf8 = OSTPlatform::Encoding::PathToUtf8(libPath);
+    std::error_code libEc;
+    if (!std::filesystem::exists(libPath, libEc) || libEc) {
+        LOG_WARN("CloudRedirect: cloud_redirect.dll not found at {}", libPathUtf8);
         return;
     }
 
     g_module = OSTPlatform::DynamicLibrary::Load(libPath);
     if (!g_module) {
         LOG_WARN("CloudRedirect: failed to load {} (err={})",
-                 libPath.string(), OSTPlatform::DynamicLibrary::GetLastErrorCode());
+                 libPathUtf8, OSTPlatform::DynamicLibrary::GetLastErrorCode());
         return;
     }
 
@@ -120,11 +185,13 @@ void Initialize(const char* steamInstallPath) {
     ok &= ResolveSymbol(g_module, "CR_Shutdown",       g_shutdownFn);
     if (!ok) {
         LOG_WARN("CloudRedirect: cloud_redirect.dll is missing required exports, disabling");
+        OSTPlatform::DynamicLibrary::Unload(g_module);
         g_module = nullptr;
         return;
     }
 
     // Optional (CR 2.2.5+)
+    ResolveSymbol(g_module, "CR_AddApp",             g_addApp);
     ResolveSymbol(g_module, "CR_EnableStatsSync",    g_enableStatsSync);
     ResolveSymbol(g_module, "CR_SetAccountId",       g_setAccountId);
     ResolveSymbol(g_module, "CR_NotifyAppRunning",   g_notifyAppRunning);
@@ -132,89 +199,282 @@ void Initialize(const char* steamInstallPath) {
     ResolveSymbol(g_module, "CR_GetAchievements",    g_getAchievements);
     ResolveSymbol(g_module, "CR_InstallVtableHooks", g_installVtableHooks);
 
-    if (!g_initCloudSave(steamInstallPath, &CloudNotify)) {
-        LOG_WARN("CloudRedirect: CR_InitCloudSave failed, disabling cloud save redirection");
+    try {
+        if (!g_initCloudSave(steamInstallPath, &CloudNotify)) {
+            LOG_WARN("CloudRedirect: CR_InitCloudSave failed, disabling cloud save redirection");
+            OSTPlatform::DynamicLibrary::Unload(g_module);
+            g_module = nullptr;
+            return;
+        }
+    } catch (const std::exception& e) {
+        LOG_ERROR("CloudRedirect: CR_InitCloudSave threw exception: {}", e.what());
+        OSTPlatform::DynamicLibrary::Unload(g_module);
+        g_module = nullptr;
+        return;
+    } catch (...) {
+        LOG_ERROR("CloudRedirect: CR_InitCloudSave threw unknown exception");
+        OSTPlatform::DynamicLibrary::Unload(g_module);
         g_module = nullptr;
         return;
     }
 
     g_active.store(true, std::memory_order_release);
-    LOG_INFO("CloudRedirect: loaded {} and initialised cloud save redirection",
-             libPath.string());
+    LOG_INFO("CloudRedirect: loaded {} and initialised cloud save redirection (diversion: {:p})",
+             libPathUtf8, static_cast<void*>(client_hModule));
+
+    if (g_setAccountId) {
+        const uint32_t cachedAccId = g_cachedAccountId.load(std::memory_order_acquire);
+        if (cachedAccId != 0) {
+            try {
+                g_setAccountId(cachedAccId);
+                LOG_INFO("CloudRedirect: applied cached account id {}", cachedAccId);
+            } catch (const std::exception& e) {
+                LOG_WARN("CloudRedirect: initial CR_SetAccountId threw: {}", e.what());
+            } catch (...) {
+                LOG_WARN("CloudRedirect: initial CR_SetAccountId threw unknown exception");
+            }
+        }
+    }
 
     if (g_enableStatsSync) {
-        g_enableStatsSync(true, true);
-        LOG_INFO("CloudRedirect: stats sync registered");
+        try {
+            g_enableStatsSync(true, true);
+            LOG_INFO("CloudRedirect: stats sync registered");
+        } catch (const std::exception& e) {
+            LOG_WARN("CloudRedirect: CR_EnableStatsSync threw: {}", e.what());
+        } catch (...) {
+            LOG_WARN("CloudRedirect: CR_EnableStatsSync threw unknown exception");
+        }
     }
 
     // Push the current unlocked-app set without re-locking g_mutex.
-    std::vector<AppId_t> depots = LuaConfig::GetAllDepotIds();
-    std::vector<uint32_t> appIds(depots.begin(), depots.end());
-    g_setApps(appIds.empty() ? nullptr : appIds.data(),
-              static_cast<uint32_t>(appIds.size()));
-    LOG_INFO("CloudRedirect: registered {} redirected app(s)", appIds.size());
+    try {
+        const std::vector<AppId_t> depots = CollectRedirectedAppIds();
+        g_setApps(depots.empty() ? nullptr : depots.data(),
+                  static_cast<uint32_t>(depots.size()));
+        LOG_INFO("CloudRedirect: registered {} redirected app(s)", depots.size());
+    } catch (const std::exception& e) {
+        LOG_WARN("CloudRedirect: initial CR_SetApps threw: {}", e.what());
+    } catch (...) {
+        LOG_WARN("CloudRedirect: initial CR_SetApps threw unknown exception");
+    }
 
     // Vtable hooks let CR handle Cloud RPCs synchronously (slot4 semantics).
     if (g_installVtableHooks) {
-        if (g_installVtableHooks())
-            LOG_INFO("CloudRedirect: vtable hooks installed");
-        else
-            LOG_WARN("CloudRedirect: vtable hook install failed, using packet-layer path");
+        try {
+            if (g_installVtableHooks())
+                LOG_INFO("CloudRedirect: vtable hooks installed (routed to diversion module)");
+            else
+                LOG_WARN("CloudRedirect: vtable hook install failed, using packet-layer path");
+        } catch (const std::exception& e) {
+            LOG_WARN("CloudRedirect: CR_InstallVtableHooks threw: {}", e.what());
+        } catch (...) {
+            LOG_WARN("CloudRedirect: CR_InstallVtableHooks threw unknown exception");
+        }
     }
 }
 
 void SyncAppSet() {
     if (!g_active.load(std::memory_order_acquire) || !g_setApps) return;
 
-    std::vector<AppId_t> depots = LuaConfig::GetAllDepotIds();
-    std::vector<uint32_t> appIds(depots.begin(), depots.end());
-    g_setApps(appIds.empty() ? nullptr : appIds.data(),
-              static_cast<uint32_t>(appIds.size()));
-    LOG_DEBUG("CloudRedirect: re-synced redirected app set ({} app(s))", appIds.size());
+    try {
+        const std::vector<AppId_t> depots = CollectRedirectedAppIds();
+        g_setApps(depots.empty() ? nullptr : depots.data(),
+                  static_cast<uint32_t>(depots.size()));
+        LOG_DEBUG("CloudRedirect: re-synced redirected app set ({} app(s))", depots.size());
+    } catch (const std::exception& e) {
+        LOG_ERROR("CloudRedirect: CR_SetApps failed: {}", e.what());
+    } catch (...) {
+        LOG_ERROR("CloudRedirect: CR_SetApps failed with unknown exception");
+    }
 }
 
-bool IsActive() {
+void SetOnlineFixAppResolver(OnlineFixAppResolver resolver) {
+    g_onlineFixResolver.store(resolver, std::memory_order_release);
+}
+
+void SetLicenseChecker(LicenseChecker checker) {
+    g_licenseChecker.store(checker, std::memory_order_release);
+}
+
+bool IsActive() noexcept {
     return g_active.load(std::memory_order_acquire);
 }
 
 bool IsApp(uint32_t appId) {
-    if (!g_active.load(std::memory_order_acquire) || !g_isApp) return false;
-    return g_isApp(appId);
+    if (IsAppLicensed(appId)) return false;
+    if (!g_active.load(std::memory_order_acquire)) return false;
+    try {
+        if (g_isApp && g_isApp(appId)) return true;
+    } catch (const std::exception& e) {
+        LOG_ERROR("CloudRedirect: CR_IsApp({}) failed: {}", appId, e.what());
+        return false;
+    } catch (...) {
+        LOG_ERROR("CloudRedirect: CR_IsApp({}) failed with unknown exception", appId);
+        return false;
+    }
+    const auto resolver = g_onlineFixResolver.load(std::memory_order_relaxed);
+    const uint32_t fixAppId = resolver ? resolver() : 0;
+    if (fixAppId != 0 && appId == fixAppId) return true;
+    return false;
+}
+
+void AddApp(uint32_t appId) {
+    if (IsAppLicensed(appId)) return;
+    if (!g_active.load(std::memory_order_acquire) || !g_addApp) return;
+    try {
+        g_addApp(appId);
+        LOG_INFO("CloudRedirect: dynamically added app {}", appId);
+    } catch (const std::exception& e) {
+        LOG_ERROR("CloudRedirect: CR_AddApp({}) failed: {}", appId, e.what());
+    } catch (...) {
+        LOG_ERROR("CloudRedirect: CR_AddApp({}) failed with unknown exception", appId);
+    }
 }
 
 bool HandleCloudRpc(const char* method, uint32_t appId, uint32_t accountId,
-                    const uint8_t* reqBody, uint32_t reqLen,
-                    uint8_t* respBuf, uint32_t respMaxLen,
+                    const uint8* reqBody, uint32_t reqLen,
+                    uint8* respBuf, uint32_t respMaxLen,
                     uint32_t* respLen, int32_t* eresult) {
-    if (!g_active.load(std::memory_order_acquire) || !g_handleCloudRpc) return false;
-    return g_handleCloudRpc(method, appId, accountId, reqBody, reqLen,
-                            respBuf, respMaxLen, respLen, eresult);
+    if (!method || method[0] == '\0' || appId == 0 || !respLen || !eresult) return false;
+    if (IsAppLicensed(appId)) return false;
+
+    InFlightGuard guard;
+    if (!guard || !g_handleCloudRpc) return false;
+
+    if (reqLen > 0 && !reqBody) return false;
+    if (respMaxLen > 0 && !respBuf) return false;
+
+    try {
+        const bool handled = g_handleCloudRpc(method, appId, accountId, reqBody, reqLen,
+                                              respBuf, respMaxLen, respLen, eresult);
+        if (handled) {
+            if (*respLen > respMaxLen) {
+                LOG_ERROR("CloudRedirect: CR_HandleCloudRpc buffer overrun detected (got {}, max {})",
+                          *respLen, respMaxLen);
+                *respLen = respMaxLen;
+                return false;
+            }
+        }
+        return handled;
+    } catch (const std::exception& e) {
+        LOG_ERROR("CloudRedirect: CR_HandleCloudRpc({}, {}) failed: {}", method, appId, e.what());
+        return false;
+    } catch (...) {
+        LOG_ERROR("CloudRedirect: CR_HandleCloudRpc({}, {}) failed with unknown exception", method, appId);
+        return false;
+    }
+}
+
+bool HandleCloudRpc(const char* method, uint32_t appId, uint32_t accountId,
+                    std::span<const uint8_t> reqBody,
+                    std::span<uint8_t> respBuf,
+                    uint32_t* respLen, int32_t* eresult) {
+    return HandleCloudRpc(method, appId, accountId,
+                          reqBody.data(), static_cast<uint32_t>(reqBody.size()),
+                          respBuf.data(), static_cast<uint32_t>(respBuf.size()),
+                          respLen, eresult);
 }
 
 void SetAccountId(uint32_t accountId) {
+    if (accountId == 0) return;
+    const uint32_t prev = g_cachedAccountId.exchange(accountId, std::memory_order_acq_rel);
     if (!g_active.load(std::memory_order_acquire) || !g_setAccountId) return;
-    g_setAccountId(accountId);
+    if (prev == accountId) return;
+    try {
+        g_setAccountId(accountId);
+        LOG_INFO("CloudRedirect: set account id {}", accountId);
+    } catch (const std::exception& e) {
+        LOG_ERROR("CloudRedirect: CR_SetAccountId({}) failed: {}", accountId, e.what());
+    } catch (...) {
+        LOG_ERROR("CloudRedirect: CR_SetAccountId({}) failed with unknown exception", accountId);
+    }
 }
 
 void NotifyAppRunning(uint32_t appId, bool running) {
     if (!g_active.load(std::memory_order_acquire) || !g_notifyAppRunning) return;
-    g_notifyAppRunning(appId, running);
+    try {
+        g_notifyAppRunning(appId, running);
+        LOG_INFO("CloudRedirect: notified app {} running={}", appId, running);
+    } catch (const std::exception& e) {
+        LOG_ERROR("CloudRedirect: CR_NotifyAppRunning({}, {}) failed: {}", appId, running, e.what());
+    } catch (...) {
+        LOG_ERROR("CloudRedirect: CR_NotifyAppRunning({}, {}) failed with unknown exception", appId, running);
+    }
 }
 
 void NotifyStatsStored(uint32_t appId) {
+    if (IsAppLicensed(appId)) return;
     if (!g_active.load(std::memory_order_acquire) || !g_notifyStatsStored) return;
-    g_notifyStatsStored(appId);
+    try {
+        g_notifyStatsStored(appId);
+    } catch (const std::exception& e) {
+        LOG_ERROR("CloudRedirect: CR_NotifyStatsStored({}) failed: {}", appId, e.what());
+    } catch (...) {
+        LOG_ERROR("CloudRedirect: CR_NotifyStatsStored({}) failed with unknown exception", appId);
+    }
 }
 
 uint32_t GetAchievements(uint32_t appId, AchievementBlock* out, uint32_t maxBlocks) {
-    if (!g_active.load(std::memory_order_acquire) || !g_getAchievements) return 0;
-    return g_getAchievements(appId, out, maxBlocks);
+    if (appId == 0 || !out || maxBlocks == 0) return 0;
+    if (IsAppLicensed(appId)) return 0;
+
+    InFlightGuard guard;
+    if (!guard || !g_getAchievements) return 0;
+
+    try {
+        const uint32_t count = g_getAchievements(appId, out, maxBlocks);
+        return std::min(count, maxBlocks);
+    } catch (const std::exception& e) {
+        LOG_ERROR("CloudRedirect: CR_GetAchievements({}) failed: {}", appId, e.what());
+        return 0;
+    } catch (...) {
+        LOG_ERROR("CloudRedirect: CR_GetAchievements({}) failed with unknown exception", appId);
+        return 0;
+    }
+}
+
+uint32_t GetAchievements(uint32_t appId, std::span<AchievementBlock> outBlocks) {
+    return GetAchievements(appId, outBlocks.data(), static_cast<uint32_t>(outBlocks.size()));
 }
 
 void Shutdown() {
     std::lock_guard lock(g_mutex);
-    if (!g_active.exchange(false)) return;
-    if (g_shutdownFn) g_shutdownFn();
+    if (!g_active.exchange(false, std::memory_order_acq_rel)) return;
+
+    // Bounded wait (up to 50ms) for in-flight calls to exit, preventing Loader Lock deadlock.
+    for (int i = 0; i < 50 && g_inFlightCalls.load(std::memory_order_acquire) > 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    g_cachedAccountId.store(0, std::memory_order_release);
+    g_onlineFixResolver.store(nullptr, std::memory_order_release);
+    g_licenseChecker.store(nullptr, std::memory_order_release);
+    if (g_shutdownFn) {
+        try {
+            g_shutdownFn();
+        } catch (const std::exception& e) {
+            LOG_ERROR("CloudRedirect: CR_Shutdown failed: {}", e.what());
+        } catch (...) {
+            LOG_ERROR("CloudRedirect: CR_Shutdown failed with unknown exception");
+        }
+    }
+    if (g_module) {
+        OSTPlatform::DynamicLibrary::Unload(g_module);
+        g_module = nullptr;
+    }
+    g_initCloudSave      = nullptr;
+    g_handleCloudRpc     = nullptr;
+    g_setApps            = nullptr;
+    g_addApp             = nullptr;
+    g_isApp              = nullptr;
+    g_shutdownFn         = nullptr;
+    g_enableStatsSync    = nullptr;
+    g_setAccountId       = nullptr;
+    g_notifyAppRunning   = nullptr;
+    g_notifyStatsStored  = nullptr;
+    g_getAchievements    = nullptr;
+    g_installVtableHooks = nullptr;
     LOG_INFO("CloudRedirect: shut down");
 }
 
