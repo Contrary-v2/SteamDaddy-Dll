@@ -14,7 +14,7 @@ namespace VehCommon {
     constexpr uint64_t kMaxX64InsnLen = 15;
 
     // ── RIP comparisons ──────────────────────────────────────────────────────
-    inline bool IsAt(uint64_t rip, const void* target) {
+    [[nodiscard]] inline bool IsAt(uint64_t rip, const void* target) noexcept {
         return rip == reinterpret_cast<uint64_t>(target);
     }
 
@@ -22,7 +22,7 @@ namespace VehCommon {
     // instruction past `target`. Used by the SINGLE_STEP branch to recognize
     // that the trap was caused by us setting TF after restoring `target`'s
     // first byte. Independent of the prologue's actual instruction length.
-    inline bool IsPostInt3Step(uint64_t rip, const void* target) {
+    [[nodiscard]] inline bool IsPostInt3Step(uint64_t rip, const void* target) noexcept {
         auto base = reinterpret_cast<uint64_t>(target);
         return rip > base && rip <= base + kMaxX64InsnLen;
     }
@@ -34,9 +34,11 @@ namespace VehCommon {
     // Only valid before RSP moves -- i.e. on an int3 hit at the first
     // instruction of the function.
     template<typename T>
-    inline T GetArg(OSTPlatform::Trap::Context& ctx, int index) {
+    [[nodiscard]] inline T GetArg(OSTPlatform::Trap::Context& ctx, int index) noexcept {
         static_assert(sizeof(T) <= sizeof(uint64_t),
                       "GetArg<T>: T must fit in a 64-bit register slot");
+        static_assert(std::is_pointer_v<T> || std::is_integral_v<T> || std::is_enum_v<T>,
+                      "GetArg<T>: T must be a pointer, integral, or enum type (floating-point args live in XMM registers)");
         uint64_t raw = ctx.Argument(index);
         if constexpr (std::is_pointer_v<T>) {
             return reinterpret_cast<T>(raw);
@@ -73,15 +75,15 @@ namespace VehCommon {
     void Arm(Int3Site site);
 
     // True if at least one site is currently registered.
-    bool HasSites();
+    [[nodiscard]] bool HasSites();
 
     // Drive these from a Vectored Exception Handler:
     //   - returns true if the exception matched a registered site and was
     //     handled (caller should return EXCEPTION_CONTINUE_EXECUTION)
     //   - returns false if nothing matched (caller should fall through to
     //     EXCEPTION_CONTINUE_SEARCH)
-    bool OnBreakpoint(OSTPlatform::Trap::Context& ctx);
-    bool OnSingleStep(OSTPlatform::Trap::Context& ctx);
+    [[nodiscard]] bool OnBreakpoint(OSTPlatform::Trap::Context& ctx);
+    [[nodiscard]] bool OnSingleStep(OSTPlatform::Trap::Context& ctx);
 
     // Restore any still-armed bytes and clear the registry. Call during global
     // hook shutdown before removing the VEH handler.
@@ -93,9 +95,9 @@ namespace VehCommon {
     // Convenience onHit for the "capture this" pattern.
     // callbackData must point to a `void*` slot that will receive RCX (the
     // implicit `this` argument in the Windows x64 fastcall convention).
-    inline void CaptureRcxTo(OSTPlatform::Trap::Context& ctx, const Int3Site& site) {
+    // Kept strictly lock-free and logging-free for microsecond exception safety.
+    inline void CaptureRcxTo(OSTPlatform::Trap::Context& ctx, const Int3Site& site) noexcept {
         *static_cast<void**>(site.callbackData) = GetArg<void*>(ctx, 1);
-        LOG_MISC_DEBUG("CaptureRcxTo {}: captured {}", site.label, GetArg<void*>(ctx, 1));
     }
 }
 
