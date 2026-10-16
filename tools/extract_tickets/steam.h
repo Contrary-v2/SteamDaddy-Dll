@@ -12,6 +12,7 @@ typedef unsigned __int64 uint64;
 typedef int32 HSteamPipe;
 typedef int32 HSteamUser;
 typedef uint32 AppId_t;
+typedef uint32 DepotId_t;
 typedef uint64 SteamAPICall_t;
 
 // Steam universes (steamuniverse.h).
@@ -24,9 +25,13 @@ enum EUniverse {
     k_EUniverseMax
 };
 
-// EResult subset (steamclientpublic.h); only success is checked by name.
+// EResult subset (steamclientpublic.h).
 enum EResult {
     k_EResultOK = 1,
+    k_EResultFail = 2,
+    k_EResultNoConnection = 3,
+    k_EResultAccessDenied = 15,
+    k_EResultLimitExceeded = 25,
 };
 
 // Result delivered for ISteamUser::RequestEncryptedAppTicket (isteamuser.h).
@@ -41,6 +46,7 @@ inline constexpr const char* kSteamClientInterfaceVersion = "SteamClient023";
 inline constexpr const char* kSteamUserInterfaceVersion = "SteamUser023";
 inline constexpr const char* kSteamUtilsInterfaceVersion = "SteamUtils010";
 inline constexpr const char* kSteamAppTicketInterfaceVersion = "STEAMAPPTICKET_INTERFACE_VERSION001";
+inline constexpr const char* kSteamAppsInterfaceVersion = "STEAMAPPS_INTERFACE_VERSION008";
 
 // Interfaces returned by ISteamClient getters we never dereference; declared
 // opaque so the vtable slots keep their SDK signatures.
@@ -92,7 +98,13 @@ class ISteamUser {
 public:
     virtual HSteamUser GetHSteamUser() = 0;
     virtual bool BLoggedOn() = 0;
-    virtual uint64 GetSteamID() = 0;
+    // In Valve's Steamworks SDK, GetSteamID() returns CSteamID by value. Under the
+    // MSVC x64 ABI for member functions, returning a class with user-defined constructors
+    // requires the caller to allocate storage and pass a pointer to it in RDX (with 'this'
+    // in RCX), returning that pointer in RAX. Declaring it as GetSteamID(uint64* pOutSteamID)
+    // guarantees that MSVC x64 puts 'this' in RCX and pOutSteamID in RDX, perfectly matching
+    // steamclient64.dll's vtable wrapper and avoiding access violation crashes (0xc0000005).
+    virtual uint64* GetSteamID(uint64* pOutSteamID) = 0;
     virtual int InitiateGameConnection_DEPRECATED(void*, int, uint64, uint32, uint16, bool) = 0;
     virtual void TerminateGameConnection_DEPRECATED(uint32, uint16) = 0;
     virtual void TrackAppUsageEvent(uint64, int, const char*) = 0;
@@ -120,6 +132,31 @@ class ISteamAppTicket
 {
 public:
     virtual uint32 GetAppOwnershipTicketData( uint32 nAppID, void *pvBuffer, uint32 cbBufferLength, uint32 *piAppId, uint32 *piSteamId, uint32 *piSignature, uint32 *pcbSignature ) = 0;
+};
+
+// isteamapps.h
+class ISteamApps {
+public:
+    virtual bool BIsSubscribed() = 0;
+    virtual bool BIsLowViolence() = 0;
+    virtual bool BIsCybercafe() = 0;
+    virtual bool BIsVACBanned() = 0;
+    virtual const char* GetCurrentGameLanguage() = 0;
+    virtual const char* GetAvailableGameLanguages() = 0;
+    virtual bool BIsSubscribedApp(AppId_t appID) = 0;
+    virtual bool BIsDlcInstalled(AppId_t appID) = 0;
+    virtual uint32 GetEarliestPurchaseUnixTime(AppId_t nAppID) = 0;
+    virtual bool BIsSubscribedFromFreeWeekend() = 0;
+    virtual int GetDLCCount() = 0;
+    virtual bool BGetDLCDataByIndex(int iDLC, AppId_t* pAppID, bool* pbAvailable, char* pchName, int cchNameBufferSize) = 0;
+    virtual void InstallDLC(AppId_t nAppID) = 0;
+    virtual void UninstallDLC(AppId_t nAppID) = 0;
+    virtual void RequestAppProofOfPurchaseKey(AppId_t nAppID) = 0;
+    virtual bool GetCurrentBetaName(char* pchName, int cchNameBufferSize) = 0;
+    virtual bool MarkContentCorrupt(bool bMissingFilesOnly) = 0;
+    virtual uint32 GetInstalledDepots(AppId_t appID, DepotId_t* pvecDepots, uint32 cMaxDepots) = 0;
+    virtual uint32 GetAppInstallDir(AppId_t appID, char* pchFolder, uint32 cchFolderBufferSize) = 0;
+    virtual bool BIsAppInstalled(AppId_t appID) = 0;
 };
 
 typedef void* (*CreateInterfaceFn)(const char* pName, int* pReturnCode);
