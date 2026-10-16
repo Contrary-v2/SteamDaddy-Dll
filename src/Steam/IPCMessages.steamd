@@ -114,13 +114,13 @@ interface IClientUser {
     CSteamID GetSteamID();
 
     uint32 GetAppOwnershipTicketExtendedData(
-        in  uint32 unAppID,
-        in  int32  cbMaxTicket,
-        out bytes  pTicket[cbMaxTicket],
-        out uint32 piAppId,
-        out uint32 piSteamId,
-        out uint32 piSignature,
-        out uint32 pcbSignature
+        in  AppId_t unAppID,
+        in  int32   cbMaxTicket,
+        out bytes   pTicket[cbMaxTicket],
+        out AppId_t piAppId,
+        out uint32  piSteamId,
+        out uint32  piSignature,
+        out uint32  pcbSignature
     );
 
     SteamAPICall_t RequestEncryptedAppTicket(
@@ -139,10 +139,10 @@ interface IClientUtils {
     AppId_t GetAppID();
 
     bool GetAPICallResult(
-        in  uint64 hSteamAPICall,
-        in  uint32 cubCallback,
-        in  uint32 iCallbackExpected,
-        out bytes  pCallback[cubCallback],
-        out bool   pbFailed
+        in  SteamAPICall_t hSteamAPICall,
+        in  uint32         cubCallback,
+        in  uint32         iCallbackExpected,
+        out bytes          pCallback[cubCallback],
+        out bool           pbFailed
     );
 }
