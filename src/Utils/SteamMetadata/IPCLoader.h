@@ -26,10 +26,10 @@ namespace IPCLoader {
     bool Load(const std::string& steamclientPath);
 
     // Return nullptr when metadata is unavailable for a method.
-    const Method* Find(EIPCInterface interfaceID, uint32_t funcHash);
-    const Method* Find(std::string_view ifaceName, std::string_view methodName);
+    [[nodiscard]] const Method* Find(EIPCInterface interfaceID, uint32_t funcHash);
+    [[nodiscard]] const Method* Find(std::string_view ifaceName, std::string_view methodName);
 
-    size_t InterfaceCount();
-    size_t MethodCount();
+    [[nodiscard]] size_t InterfaceCount() noexcept;
+    [[nodiscard]] size_t MethodCount() noexcept;
 
 } // namespace IPCLoader
