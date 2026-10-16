@@ -6,7 +6,7 @@ namespace OSTPlatform {
 
 class Stopwatch {
 public:
-    double ElapsedMs() const {
+    [[nodiscard]] double ElapsedMs() const noexcept {
         const auto elapsed = std::chrono::steady_clock::now() - start_;
         return std::chrono::duration<double, std::milli>(elapsed).count();
     }

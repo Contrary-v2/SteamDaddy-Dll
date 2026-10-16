@@ -1,6 +1,6 @@
 #pragma once
 
-#include "dllmain.h"
+#include "Steam/Types.h"
 
 namespace Hooks_Package {
     // LoadPackage + CheckAppOwnership — patches the package store so that
@@ -11,4 +11,17 @@ namespace Hooks_Package {
     // Mark package 0 as changed and trigger CClientAppManager_ProcessPendingLicenseUpdates.
     void NotifyLicenseChanged();
 
+    // Fallback late-hook bootstrapping: Steam checked ownership before hooks were active.
+    // Priming next CheckAppOwnership to force a re-query once with captured CUser.
+    void RequestRequeryOnce();
+
+    // Queries whether the current Steam account genuinely owns the license for this AppId/DLC.
+    // Checks memory cache first, falling back to direct oCheckAppOwnership if CUser is captured.
+    [[nodiscard]] bool IsAppTrulyOwned(AppId_t appId);
+
+    // Queries whether the current Steam account has a valid family sharing license for this AppId.
+    [[nodiscard]] bool IsSharedLicense(AppId_t appId);
+
+    // Returns true if the account either genuinely owns the license or has a valid family shared license.
+    [[nodiscard]] bool HasValidLicense(AppId_t appId);
 }

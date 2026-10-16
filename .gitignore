@@ -1,5 +1,6 @@
 # Build output
 build/
+build-*/
 .deps/
 
 # Visual Studio
@@ -21,3 +22,10 @@ build/
 
 # DLLs (keep only source files)
 !.deps/**/*.dll
+# Comparison / local folders
+OpenSteamTool-1.5.3.6/
+
+.vscode/
+
+CloudRedirect-2.6.5/
+*.zip

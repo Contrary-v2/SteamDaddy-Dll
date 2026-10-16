@@ -1,9 +1,9 @@
 #pragma once
 
-#include <string>
+#include <string_view>
 
 namespace OSTPlatform::Dialog {
 
-    void ShowWarning(std::string title, std::string message);
+    void ShowWarning(std::string_view title, std::string_view message);
 
 } // namespace OSTPlatform::Dialog
