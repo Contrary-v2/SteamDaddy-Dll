@@ -25,12 +25,17 @@ public:
         : data_(size ? std::make_unique_for_overwrite<uint8_t[]>(size) : nullptr),
           size_(size) {}
 
-    uint8_t* data() { return data_.get(); }
-    const uint8_t* data() const { return data_.get(); }
-    size_t size() const { return size_; }
-    bool empty() const { return size_ == 0; }
+    [[nodiscard]] uint8_t* data() noexcept { return data_.get(); }
+    [[nodiscard]] const uint8_t* data() const noexcept { return data_.get(); }
+    [[nodiscard]] size_t size() const noexcept { return size_; }
+    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
 
-    operator std::span<const uint8_t>() const { return {data_.get(), size_}; }
+    [[nodiscard]] std::span<uint8_t> span() noexcept { return {data_.get(), size_}; }
+    [[nodiscard]] std::span<const uint8_t> span() const noexcept { return {data_.get(), size_}; }
+    [[nodiscard]] std::span<const uint8_t> const_span() const noexcept { return {data_.get(), size_}; }
+
+    operator std::span<const uint8_t>() const noexcept { return {data_.get(), size_}; }
+    operator std::span<uint8_t>() noexcept { return {data_.get(), size_}; }
 
 private:
     std::unique_ptr<uint8_t[]> data_;
@@ -43,34 +48,40 @@ struct Section {
     uint32_t virtualSize = 0;
     uint32_t rawOffset = 0;
     uint32_t rawSize = 0;
+    uint32_t characteristics = 0;  // IMAGE_SECTION_HEADER::Characteristics
 
-    bool ContainsRva(uint32_t rva) const;
+    [[nodiscard]] bool ContainsRva(uint32_t rva) const noexcept;
+    // IMAGE_SCN_MEM_EXECUTE / IMAGE_SCN_MEM_WRITE — a section that is both is a
+    // W^X violation (self-modifying code), the hallmark of a runtime-decrypting
+    // protector.
+    [[nodiscard]] bool IsExecutable() const noexcept { return (characteristics & 0x20000000u) != 0; }
+    [[nodiscard]] bool IsWritable() const noexcept { return (characteristics & 0x80000000u) != 0; }
 };
 
 struct Export {
     uint32_t rva = 0;
     std::string forwarder;
 
-    bool IsForwarder() const { return !forwarder.empty(); }
+    [[nodiscard]] bool IsForwarder() const noexcept { return !forwarder.empty(); }
 };
 
 class Image {
 public:
     explicit Image(const std::filesystem::path& path);
 
-    explicit operator bool() const { return valid_; }
-    const std::filesystem::path& Path() const { return path_; }
-    uint64_t FileSize() const { return fileSize_; }
-    uint32_t EntryPointRva() const { return entryPointRva_; }
-    std::span<const Section> Sections() const { return sections_; }
+    [[nodiscard]] explicit operator bool() const noexcept { return valid_; }
+    [[nodiscard]] const std::filesystem::path& Path() const noexcept { return path_; }
+    [[nodiscard]] uint64_t FileSize() const noexcept { return fileSize_; }
+    [[nodiscard]] uint32_t EntryPointRva() const noexcept { return entryPointRva_; }
+    [[nodiscard]] std::span<const Section> Sections() const noexcept { return sections_; }
 
-    bool HasSection(std::string_view name) const;
-    const Section* SectionContainingRva(uint32_t rva) const;
-    std::optional<size_t> RvaToOffset(uint32_t rva) const;
-    std::optional<uint32_t> RawOffsetToRva(size_t rawOffset) const;
-    ByteBuffer ReadRawBytes(size_t offset, size_t size) const;
-    ByteBuffer ReadAllBytes() const;
-    std::optional<Export> FindExport(std::string_view symbolName) const;
+    [[nodiscard]] bool HasSection(std::string_view name) const;
+    [[nodiscard]] const Section* SectionContainingRva(uint32_t rva) const;
+    [[nodiscard]] std::optional<size_t> RvaToOffset(uint32_t rva) const;
+    [[nodiscard]] std::optional<uint32_t> RawOffsetToRva(size_t rawOffset) const;
+    [[nodiscard]] ByteBuffer ReadRawBytes(size_t offset, size_t size) const;
+    [[nodiscard]] ByteBuffer ReadAllBytes() const;
+    [[nodiscard]] std::optional<Export> FindExport(std::string_view symbolName) const;
 
 private:
     std::filesystem::path path_;

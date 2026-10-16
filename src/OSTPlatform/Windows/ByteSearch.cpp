@@ -1,6 +1,7 @@
 #include "include/ByteSearch.h"
 
 #include "Windows/Handles.h"
+#include "include/Encoding.h"
 #include "include/Log.h"
 #include "include/Stopwatch.h"
 
@@ -18,7 +19,7 @@ namespace {
 class FixedPatternScanner {
 public:
     explicit FixedPatternScanner(std::span<const uint8_t> pattern)
-        : pattern_(pattern.begin(), pattern.end()) {
+        : pattern_(pattern) {
         const size_t patternSize = pattern_.size();
         skip_.fill(patternSize == 0 ? 1 : patternSize);
         if (patternSize <= 1) return;
@@ -28,7 +29,7 @@ public:
         }
     }
 
-    std::optional<size_t> Find(std::span<const uint8_t> bytes) const {
+    [[nodiscard]] std::optional<size_t> Find(std::span<const uint8_t> bytes) const {
         const size_t patternSize = pattern_.size();
         if (patternSize == 0 || bytes.size() < patternSize) return std::nullopt;
 
@@ -49,10 +50,10 @@ public:
         return std::nullopt;
     }
 
-    size_t PatternSize() const { return pattern_.size(); }
+    [[nodiscard]] size_t PatternSize() const noexcept { return pattern_.size(); }
 
 private:
-    std::vector<uint8_t> pattern_;
+    std::span<const uint8_t> pattern_;
     std::array<size_t, 256> skip_{};
 };
 
@@ -101,6 +102,7 @@ std::optional<uint64_t> FindInFileRange(
     std::span<const uint8_t> pattern,
     size_t chunkBytes) {
     const Stopwatch totalTimer;
+    const std::string pathUtf8 = Encoding::PathToUtf8(path);
     FixedPatternScanner scanner(pattern);
     const size_t patternSize = scanner.PatternSize();
     if (patternSize == 0 || size == 0) return std::nullopt;
@@ -108,21 +110,21 @@ std::optional<uint64_t> FindInFileRange(
     Windows::UniqueFileHandle file = OpenForOverlappedSequentialRead(path);
     if (!file) {
         OSTP_LOG_DEBUG("ByteSearch::FindInFileRange open failed path={} offset=0x{:X} size={} err={}",
-                       path.string(), offset, size, ::GetLastError());
+                       pathUtf8, offset, size, ::GetLastError());
         return std::nullopt;
     }
 
     LARGE_INTEGER sizeLi{};
     if (!::GetFileSizeEx(file.get(), &sizeLi) || sizeLi.QuadPart <= 0) {
         OSTP_LOG_DEBUG("ByteSearch::FindInFileRange empty/invalid file path={} offset=0x{:X} size={}",
-                       path.string(), offset, size);
+                       pathUtf8, offset, size);
         return std::nullopt;
     }
 
     const uint64_t fileSize = static_cast<uint64_t>(sizeLi.QuadPart);
     if (offset >= fileSize) {
         OSTP_LOG_DEBUG("ByteSearch::FindInFileRange offset past EOF path={} offset=0x{:X} file_size={}",
-                       path.string(), offset, fileSize);
+                       pathUtf8, offset, fileSize);
         return std::nullopt;
     }
 
@@ -149,7 +151,7 @@ std::optional<uint64_t> FindInFileRange(
     };
     if (!events[0] || !events[1]) {
         OSTP_LOG_DEBUG("ByteSearch::FindInFileRange event create failed path={} err={}",
-                       path.string(), ::GetLastError());
+                       pathUtf8, ::GetLastError());
         return std::nullopt;
     }
     OVERLAPPED ov[2]{};
@@ -170,14 +172,27 @@ std::optional<uint64_t> FindInFileRange(
     };
     // Drain the in-flight read before tearing buffers down: the kernel may still be
     // writing into a buffer, so cancel and wait for the op to settle first.
-    const auto drainPending = [&]() {
-        if (pendingSlot >= 0) {
-            ::CancelIoEx(file.get(), &ov[pendingSlot]);
-            DWORD discarded = 0;
-            ::GetOverlappedResult(file.get(), &ov[pendingSlot], &discarded, TRUE);
-            pendingSlot = -1;
+    struct PendingDrainGuard {
+        HANDLE file = nullptr;
+        OVERLAPPED* ov = nullptr;
+        int* pendingSlot = nullptr;
+
+        PendingDrainGuard(HANDLE f, OVERLAPPED* o, int* p) noexcept
+            : file(f), ov(o), pendingSlot(p) {}
+
+        void Drain() {
+            if (pendingSlot && *pendingSlot >= 0 && file && ov) {
+                ::CancelIoEx(file, &ov[*pendingSlot]);
+                DWORD discarded = 0;
+                ::GetOverlappedResult(file, &ov[*pendingSlot], &discarded, TRUE);
+                *pendingSlot = -1;
+            }
         }
-    };
+
+        ~PendingDrainGuard() {
+            Drain();
+        }
+    } drainGuard(file.get(), ov, &pendingSlot);
 
     uint64_t bytesReadTotal = 0;
     size_t chunks = 0;
@@ -191,7 +206,7 @@ std::optional<uint64_t> FindInFileRange(
             (std::min)(static_cast<uint64_t>(chunkBytes), rangeEnd - curStart));
         if (!issueRead(slot, curStart, len)) {
             OSTP_LOG_DEBUG("ByteSearch::FindInFileRange read start failed path={} offset=0x{:X} err={}",
-                           path.string(), curStart, ::GetLastError());
+                           pathUtf8, curStart, ::GetLastError());
             return std::nullopt;
         }
     }
@@ -206,7 +221,7 @@ std::optional<uint64_t> FindInFileRange(
             const DWORD err = ::GetLastError();
             if (err != ERROR_HANDLE_EOF) {
                 OSTP_LOG_DEBUG("ByteSearch::FindInFileRange read failed path={} offset=0x{:X} err={}",
-                               path.string(), curStart, err);
+                               pathUtf8, curStart, err);
                 return std::nullopt;
             }
             got = 0;
@@ -227,7 +242,7 @@ std::optional<uint64_t> FindInFileRange(
                 (std::min)(static_cast<uint64_t>(chunkBytes), rangeEnd - nextStart));
             if (!issueRead(nextSlot, nextStart, nextLen)) {
                 OSTP_LOG_DEBUG("ByteSearch::FindInFileRange read start failed path={} offset=0x{:X} err={}",
-                               path.string(), nextStart, ::GetLastError());
+                               pathUtf8, nextStart, ::GetLastError());
                 return std::nullopt;
             }
         }
@@ -236,10 +251,10 @@ std::optional<uint64_t> FindInFileRange(
         const auto match = scanner.Find(std::span<const uint8_t>(buffers[slot].get(), got));
         scanMs += scanTimer.ElapsedMs();
         if (match) {
-            drainPending();
+            drainGuard.Drain();
             const uint64_t absoluteMatch = curStart + *match;
             OSTP_LOG_DEBUG("ByteSearch::FindInFileRange matched path={} range=[0x{:X},0x{:X}) match=0x{:X} bytes_read={} chunks={} read_ms={:.3f} bmh_ms={:.3f} total_ms={:.3f}",
-                           path.string(),
+                           pathUtf8,
                            offset,
                            rangeEnd,
                            absoluteMatch,
@@ -257,7 +272,7 @@ std::optional<uint64_t> FindInFileRange(
     }
 
     OSTP_LOG_DEBUG("ByteSearch::FindInFileRange no match path={} range=[0x{:X},0x{:X}) bytes_read={} chunks={} read_ms={:.3f} bmh_ms={:.3f} total_ms={:.3f}",
-                   path.string(),
+                   pathUtf8,
                    offset,
                    rangeEnd,
                    bytesReadTotal,
