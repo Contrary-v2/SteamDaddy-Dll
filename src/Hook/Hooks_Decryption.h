@@ -1,5 +1,9 @@
 #pragma once
-#include "dllmain.h"
+
+#include "Steam/Types.h"
+
+#include <cstdint>
+#include <vector>
 
 namespace Hooks_Decryption {
     // LoadDepotDecryptionKey hook: serves user-provided decryption keys for
@@ -7,5 +11,5 @@ namespace Hooks_Decryption {
     void Install();
     void Uninstall();
 
-    std::vector<uint8_t> GetCacheAppOwnershipTicket(AppId_t appId);
+    [[nodiscard]] std::vector<uint8_t> GetCacheAppOwnershipTicket(AppId_t appId);
 }
