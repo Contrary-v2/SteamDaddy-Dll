@@ -204,13 +204,41 @@ bool EnsureDiversionFileReady(const std::wstring& originalPath, const std::wstri
             ::SetFileAttributesW(diversionPath.c_str(), FILE_ATTRIBUTE_NORMAL);
         }
 
-        if (::CopyFileW(originalPath.c_str(), diversionPath.c_str(), FALSE)) {
-            LOG_INFO("Hooks_Diversion: Cloned steamclient64.dll -> diversion64.dll");
-            g_IsDiversionActive.store(true, std::memory_order_release);
-            return true;
+        // Atomic clone via temp file + MoveFileExW:
+        // When multiple processes or threads access diversion64.dll, writing directly can cause torn reads.
+        // MoveFileExW is atomic on NTFS (metadata directory-entry pointer swap).
+        const std::wstring tmpPath = diversionPath + L".tmp";
+        const DWORD tmpAttrs = ::GetFileAttributesW(tmpPath.c_str());
+        if (tmpAttrs != INVALID_FILE_ATTRIBUTES && (tmpAttrs & FILE_ATTRIBUTE_READONLY)) {
+            ::SetFileAttributesW(tmpPath.c_str(), FILE_ATTRIBUTE_NORMAL);
         }
-        const DWORD gle = ::GetLastError();
-        LOG_ERROR("Hooks_Diversion: CopyFileW failed with error {}", gle);
+
+        constexpr int kDiversionCopyRetries = 10;
+        constexpr DWORD kDiversionCopyRetryDelayMs = 20;
+
+        for (int attempt = 1; attempt <= kDiversionCopyRetries; ++attempt) {
+            if (::CopyFileW(originalPath.c_str(), tmpPath.c_str(), FALSE) &&
+                ::MoveFileExW(tmpPath.c_str(), diversionPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            {
+                LOG_INFO("Hooks_Diversion: Cloned steamclient64.dll -> diversion64.dll (atomic move)");
+                g_IsDiversionActive.store(true, std::memory_order_release);
+                return true;
+            }
+
+            const DWORD gle = ::GetLastError();
+            // Retry only on transient sharing violations or access denied (file handle in closing state)
+            if (gle != ERROR_SHARING_VIOLATION && gle != ERROR_ACCESS_DENIED) {
+                LOG_WARN("Hooks_Diversion: Atomic clone failed, non-retryable error {}", gle);
+                break;
+            }
+
+            if (attempt < kDiversionCopyRetries) {
+                ::Sleep(kDiversionCopyRetryDelayMs);
+            } else {
+                LOG_ERROR("Hooks_Diversion: Atomic clone failed after {} attempts (error {})",
+                          kDiversionCopyRetries, gle);
+            }
+        }
     } catch (...) {
         LOG_ERROR("Hooks_Diversion: Exception during file clone");
     }
