@@ -160,7 +160,7 @@ static void ShowDownloadFailedPopup(const std::string& dllName,
 {
     const std::string rootLabel = IsPortableMode() ? "<PortableDir>" : "<Steam>";
     SteamDiagnostics::ShowWarning(
-        "SteamDaddy - Unsupported Steam Version / 签名文件缺失",
+        "SteamDaddy - Unsupported Steam Version",
         "SteamDaddy: signature file not found for " + dllName + ".\n\n"
         "Hooks that depend on " + dllName + " are disabled for this session; "
         "other modules are unaffected.\n\n"
@@ -362,7 +362,7 @@ void ReportMissingFunctions()
     }
 
     SteamDiagnostics::ShowWarning(
-        "SteamDaddy - Missing Signatures / 签名缺失",
+        "SteamDaddy - Missing Signatures",
         "SteamDaddy: some functions could not be located in this Steam build.\n\n"
         "Missing functions:\n" +
         list +
