@@ -470,7 +470,7 @@ namespace
                 }
             };
 
-            // ── 通道一：活跃传输集检查（通常仅 0~1 款下载中游戏）──
+            // -- Channel 1: Active transfer set check (typically 0~1 downloading games) --
             for (auto it = g_activeUpdatingApps->begin(); it != g_activeUpdatingApps->end(); ) {
                 AppId_t appId = *it;
                 CSteamApp* pApp = oGetAppByID(pCtrl, appId, false);
@@ -497,7 +497,7 @@ namespace
                 }
             }
 
-            // ── 通道二：时间片平摊步进（单帧固定 64 个轻量级已安装游戏探针）──
+            // -- Channel 2: Time-sliced round-robin probe (fixed 64 installed games per frame) --
             std::shared_ptr<const std::vector<AppId_t>> installedSnapshot;
             {
                 std::lock_guard<std::mutex> lock(g_installedMutex);
@@ -544,21 +544,21 @@ namespace
                 const bool isNowFullyInstalled = ((currentState & k_EAppStateUpdatingMask) == 0) &&
                                                  ((currentState & k_EAppStateFullyInstalled) != 0);
 
-                // 判定 1：常规状态机跳变完成
+                // Case 1: Standard state-machine update completion
                 if (wasUpdating && isNowFullyInstalled) {
                     entryIt->second = { currentState, currentChangeNum };
                     std::erase(*g_activeUpdatingApps, appId);
                     safeEnqueue(appId);
                 }
-                // 判定 2：秒级小补丁/错失 Updating 的版本号跃迁自愈兜底
+                // Case 2: Fast patch / missed updating version transition fallback
                 else if (isNowFullyInstalled && currentChangeNum != lastChangeNum) {
                     if (lastChangeNum == 0) {
                         entryIt->second.changeNumber = currentChangeNum;
                     } else if (wasRunning || (currentState & k_EAppStateAppRunning) != 0) {
-                        // 游戏处于运行中或刚刚退出运行，ChangeNumber 变更是由于启动、游玩时长或云存档同步，绝非游戏清单更新
+                        // Game is running or just exited; ChangeNumber change is due to playtime/cloud sync, not manifest update
                         entryIt->second = { currentState, currentChangeNum };
                     } else if (PipeManager::WasToolActiveRecently(appId, std::chrono::seconds(3))) {
-                        // 变更由外部提取工具（如 extract_tickets）短暂连接触发，严格跳过写盘同步
+                        // Triggered by brief connection from external tool (e.g. extract_tickets), skip disk sync
                         LOG_STEAMUI_DEBUG("AutoSync: appId={} state changed after recent tool extraction — skipping background sync", appId);
                         entryIt->second = { currentState, currentChangeNum };
                     } else {
@@ -567,7 +567,7 @@ namespace
                         safeEnqueue(appId);
                     }
                 }
-                // 判定 3：捕获到游戏开始活跃传输，晋升至通道一以享受每帧直达监控
+                // Case 3: Game entered active transfer, promote to channel 1 for per-frame monitoring
                 else if ((currentState & k_EAppStateActiveTransferMask) != 0) {
                     if (std::ranges::find(*g_activeUpdatingApps, appId) == g_activeUpdatingApps->end()) {
                         g_activeUpdatingApps->push_back(appId);
