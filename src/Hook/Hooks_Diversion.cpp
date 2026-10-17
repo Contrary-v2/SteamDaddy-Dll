@@ -15,12 +15,18 @@ namespace Hooks_Diversion {
 namespace {
 
 using LoadLibraryExW_t     = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
+using LoadLibraryW_t       = HMODULE(WINAPI*)(LPCWSTR);
+using LoadLibraryExA_t     = HMODULE(WINAPI*)(LPCSTR, HANDLE, DWORD);
+using LoadLibraryA_t       = HMODULE(WINAPI*)(LPCSTR);
 using GetModuleHandleW_t   = HMODULE(WINAPI*)(LPCWSTR);
 using GetModuleHandleA_t   = HMODULE(WINAPI*)(LPCSTR);
 using GetModuleHandleExW_t = BOOL(WINAPI*)(DWORD, LPCWSTR, HMODULE*);
 using GetModuleHandleExA_t = BOOL(WINAPI*)(DWORD, LPCSTR, HMODULE*);
 
 LoadLibraryExW_t     s_origLoadLibraryExW     = nullptr;
+LoadLibraryW_t       s_origLoadLibraryW       = nullptr;
+LoadLibraryExA_t     s_origLoadLibraryExA     = nullptr;
+LoadLibraryA_t       s_origLoadLibraryA       = nullptr;
 GetModuleHandleW_t   s_origGetModuleHandleW   = nullptr;
 GetModuleHandleA_t   s_origGetModuleHandleA   = nullptr;
 GetModuleHandleExW_t s_origGetModuleHandleExW = nullptr;
@@ -58,9 +64,11 @@ std::wstring s_wideDiversionPath;
 }
 
 HMODULE WINAPI Hooked_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags) {
-    if (lpLibFileName && IsSteamClientModuleW(lpLibFileName)) {
+    constexpr DWORD kDataFlags = LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE;
+    if (!hFile && !(dwFlags & kDataFlags) && lpLibFileName && IsSteamClientModuleW(lpLibFileName)) {
         if (!s_wideDiversionPath.empty()) {
-            HMODULE hDiv = s_origLoadLibraryExW(s_wideDiversionPath.c_str(), hFile, dwFlags);
+            HMODULE hDiv = s_origLoadLibraryExW ? s_origLoadLibraryExW(s_wideDiversionPath.c_str(), hFile, dwFlags)
+                                                : ::LoadLibraryExW(s_wideDiversionPath.c_str(), hFile, dwFlags);
             if (hDiv) {
                 auto expected = static_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(nullptr);
                 client_hModule.compare_exchange_strong(expected, reinterpret_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(hDiv));
@@ -81,7 +89,8 @@ HMODULE WINAPI Hooked_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD 
                       DiversionPath, OSTPlatform::Encoding::WideToUtf8(lpLibFileName));
         }
 
-        HMODULE hOrig = s_origLoadLibraryExW(lpLibFileName, hFile, dwFlags);
+        HMODULE hOrig = s_origLoadLibraryExW ? s_origLoadLibraryExW(lpLibFileName, hFile, dwFlags)
+                                             : ::LoadLibraryExW(lpLibFileName, hFile, dwFlags);
         if (hOrig) {
             auto expected = static_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(nullptr);
             client_hModule.compare_exchange_strong(expected, reinterpret_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(hOrig));
@@ -91,7 +100,60 @@ HMODULE WINAPI Hooked_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD 
         }
         return hOrig;
     }
-    return s_origLoadLibraryExW(lpLibFileName, hFile, dwFlags);
+    return s_origLoadLibraryExW ? s_origLoadLibraryExW(lpLibFileName, hFile, dwFlags)
+                                : ::LoadLibraryExW(lpLibFileName, hFile, dwFlags);
+}
+
+HMODULE WINAPI Hooked_LoadLibraryW(LPCWSTR lpLibFileName) {
+    if (lpLibFileName && IsSteamClientModuleW(lpLibFileName)) {
+        return Hooked_LoadLibraryExW(lpLibFileName, nullptr, 0);
+    }
+    return s_origLoadLibraryW ? s_origLoadLibraryW(lpLibFileName) : ::LoadLibraryW(lpLibFileName);
+}
+
+HMODULE WINAPI Hooked_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DWORD dwFlags) {
+    constexpr DWORD kDataFlags = LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE;
+    if (!hFile && !(dwFlags & kDataFlags) && lpLibFileName && IsSteamClientModuleA(lpLibFileName)) {
+        if (!s_wideDiversionPath.empty()) {
+            HMODULE hDiv = s_origLoadLibraryExW ? s_origLoadLibraryExW(s_wideDiversionPath.c_str(), hFile, dwFlags)
+                                                : ::LoadLibraryExW(s_wideDiversionPath.c_str(), hFile, dwFlags);
+            if (hDiv) {
+                auto expected = static_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(nullptr);
+                client_hModule.compare_exchange_strong(expected, reinterpret_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(hDiv));
+                g_IsDiversionActive.store(true, std::memory_order_release);
+
+                if (!g_HooksInstalled.load(std::memory_order_acquire) && g_hClientHooksReadyEvent) {
+                    ::WaitForSingleObject(g_hClientHooksReadyEvent, 2000);
+                }
+
+                LOG_INFO("Hooks_Diversion: Redirected LoadLibraryExA {} -> {}",
+                         lpLibFileName, DiversionPath);
+                return hDiv;
+            }
+            LOG_ERROR("Hooks_Diversion: Failed to load diversion module from {}, falling back to original {}",
+                      DiversionPath, lpLibFileName);
+        }
+
+        HMODULE hOrig = s_origLoadLibraryExA ? s_origLoadLibraryExA(lpLibFileName, hFile, dwFlags)
+                                             : ::LoadLibraryExA(lpLibFileName, hFile, dwFlags);
+        if (hOrig) {
+            auto expected = static_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(nullptr);
+            client_hModule.compare_exchange_strong(expected, reinterpret_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(hOrig));
+            if (!g_HooksInstalled.load(std::memory_order_acquire) && g_hClientHooksReadyEvent) {
+                ::WaitForSingleObject(g_hClientHooksReadyEvent, 2000);
+            }
+        }
+        return hOrig;
+    }
+    return s_origLoadLibraryExA ? s_origLoadLibraryExA(lpLibFileName, hFile, dwFlags)
+                                : ::LoadLibraryExA(lpLibFileName, hFile, dwFlags);
+}
+
+HMODULE WINAPI Hooked_LoadLibraryA(LPCSTR lpLibFileName) {
+    if (lpLibFileName && IsSteamClientModuleA(lpLibFileName)) {
+        return Hooked_LoadLibraryExA(lpLibFileName, nullptr, 0);
+    }
+    return s_origLoadLibraryA ? s_origLoadLibraryA(lpLibFileName) : ::LoadLibraryA(lpLibFileName);
 }
 
 HMODULE WINAPI Hooked_GetModuleHandleW(LPCWSTR lpModuleName) {
@@ -255,20 +317,32 @@ void Install() noexcept {
         g_hClientHooksReadyEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
     }
 
-    HMODULE hModule = ::GetModuleHandleW(L"kernelbase.dll");
-    if (!hModule) {
-        hModule = ::GetModuleHandleW(L"kernel32.dll");
-    }
-    if (!hModule) {
+    HMODULE hKernelBase = ::GetModuleHandleW(L"kernelbase.dll");
+    HMODULE hKernel32   = ::GetModuleHandleW(L"kernel32.dll");
+    if (!hKernelBase && !hKernel32) {
         LOG_ERROR("Hooks_Diversion: Failed to locate kernelbase.dll or kernel32.dll");
         return;
     }
 
-    auto pfnLoadLibraryExW = reinterpret_cast<LoadLibraryExW_t>(::GetProcAddress(hModule, "LoadLibraryExW"));
-    auto pfnGetModuleHandleW = reinterpret_cast<GetModuleHandleW_t>(::GetProcAddress(hModule, "GetModuleHandleW"));
-    auto pfnGetModuleHandleA = reinterpret_cast<GetModuleHandleA_t>(::GetProcAddress(hModule, "GetModuleHandleA"));
-    auto pfnGetModuleHandleExW = reinterpret_cast<GetModuleHandleExW_t>(::GetProcAddress(hModule, "GetModuleHandleExW"));
-    auto pfnGetModuleHandleExA = reinterpret_cast<GetModuleHandleExA_t>(::GetProcAddress(hModule, "GetModuleHandleExA"));
+    auto resolveProc = [hKernelBase, hKernel32](const char* name) -> FARPROC {
+        if (hKernelBase) {
+            FARPROC p = ::GetProcAddress(hKernelBase, name);
+            if (p) return p;
+        }
+        if (hKernel32) {
+            return ::GetProcAddress(hKernel32, name);
+        }
+        return nullptr;
+    };
+
+    auto pfnLoadLibraryExW   = reinterpret_cast<LoadLibraryExW_t>(resolveProc("LoadLibraryExW"));
+    auto pfnLoadLibraryW     = reinterpret_cast<LoadLibraryW_t>(resolveProc("LoadLibraryW"));
+    auto pfnLoadLibraryExA   = reinterpret_cast<LoadLibraryExA_t>(resolveProc("LoadLibraryExA"));
+    auto pfnLoadLibraryA     = reinterpret_cast<LoadLibraryA_t>(resolveProc("LoadLibraryA"));
+    auto pfnGetModuleHandleW = reinterpret_cast<GetModuleHandleW_t>(resolveProc("GetModuleHandleW"));
+    auto pfnGetModuleHandleA = reinterpret_cast<GetModuleHandleA_t>(resolveProc("GetModuleHandleA"));
+    auto pfnGetModuleHandleExW = reinterpret_cast<GetModuleHandleExW_t>(resolveProc("GetModuleHandleExW"));
+    auto pfnGetModuleHandleExA = reinterpret_cast<GetModuleHandleExA_t>(resolveProc("GetModuleHandleExA"));
 
     if (!pfnLoadLibraryExW || !pfnGetModuleHandleW || !pfnGetModuleHandleA || !pfnGetModuleHandleExW || !pfnGetModuleHandleExA) {
         LOG_ERROR("Hooks_Diversion: Failed to locate module management entrypoints");
@@ -276,6 +350,9 @@ void Install() noexcept {
     }
 
     s_origLoadLibraryExW     = pfnLoadLibraryExW;
+    s_origLoadLibraryW       = pfnLoadLibraryW;
+    s_origLoadLibraryExA     = pfnLoadLibraryExA;
+    s_origLoadLibraryA       = pfnLoadLibraryA;
     s_origGetModuleHandleW   = pfnGetModuleHandleW;
     s_origGetModuleHandleA   = pfnGetModuleHandleA;
     s_origGetModuleHandleExW = pfnGetModuleHandleExW;
@@ -294,6 +371,16 @@ void Install() noexcept {
         OSTPlatform::Detour::Attach(reinterpret_cast<void**>(&s_origGetModuleHandleExW), reinterpret_cast<void*>(Hooked_GetModuleHandleExW)) &&
         OSTPlatform::Detour::Attach(reinterpret_cast<void**>(&s_origGetModuleHandleExA), reinterpret_cast<void*>(Hooked_GetModuleHandleExA));
 
+    if (s_origLoadLibraryW) {
+        attachedAll = attachedAll && OSTPlatform::Detour::Attach(reinterpret_cast<void**>(&s_origLoadLibraryW), reinterpret_cast<void*>(Hooked_LoadLibraryW));
+    }
+    if (s_origLoadLibraryExA) {
+        attachedAll = attachedAll && OSTPlatform::Detour::Attach(reinterpret_cast<void**>(&s_origLoadLibraryExA), reinterpret_cast<void*>(Hooked_LoadLibraryExA));
+    }
+    if (s_origLoadLibraryA) {
+        attachedAll = attachedAll && OSTPlatform::Detour::Attach(reinterpret_cast<void**>(&s_origLoadLibraryA), reinterpret_cast<void*>(Hooked_LoadLibraryA));
+    }
+
     if (!attachedAll) {
         LOG_ERROR("Hooks_Diversion: Failed to attach module management detours");
         return;
@@ -305,7 +392,7 @@ void Install() noexcept {
     }
 
     s_isInstalled.store(true, std::memory_order_release);
-    LOG_INFO("Hooks_Diversion: Chokepoint detours installed successfully (LoadLibraryExW + GetModuleHandle family)");
+    LOG_INFO("Hooks_Diversion: Chokepoint detours installed successfully (LoadLibrary family + GetModuleHandle family)");
 }
 
 void Uninstall() noexcept {
@@ -319,6 +406,9 @@ void Uninstall() noexcept {
     }
 
     if (s_origLoadLibraryExW)     static_cast<void>(OSTPlatform::Detour::Detach(reinterpret_cast<void**>(&s_origLoadLibraryExW), reinterpret_cast<void*>(Hooked_LoadLibraryExW)));
+    if (s_origLoadLibraryW)       static_cast<void>(OSTPlatform::Detour::Detach(reinterpret_cast<void**>(&s_origLoadLibraryW), reinterpret_cast<void*>(Hooked_LoadLibraryW)));
+    if (s_origLoadLibraryExA)     static_cast<void>(OSTPlatform::Detour::Detach(reinterpret_cast<void**>(&s_origLoadLibraryExA), reinterpret_cast<void*>(Hooked_LoadLibraryExA)));
+    if (s_origLoadLibraryA)       static_cast<void>(OSTPlatform::Detour::Detach(reinterpret_cast<void**>(&s_origLoadLibraryA), reinterpret_cast<void*>(Hooked_LoadLibraryA)));
     if (s_origGetModuleHandleW)   static_cast<void>(OSTPlatform::Detour::Detach(reinterpret_cast<void**>(&s_origGetModuleHandleW), reinterpret_cast<void*>(Hooked_GetModuleHandleW)));
     if (s_origGetModuleHandleA)   static_cast<void>(OSTPlatform::Detour::Detach(reinterpret_cast<void**>(&s_origGetModuleHandleA), reinterpret_cast<void*>(Hooked_GetModuleHandleA)));
     if (s_origGetModuleHandleExW) static_cast<void>(OSTPlatform::Detour::Detach(reinterpret_cast<void**>(&s_origGetModuleHandleExW), reinterpret_cast<void*>(Hooked_GetModuleHandleExW)));
