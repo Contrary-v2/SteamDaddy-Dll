@@ -237,7 +237,7 @@ bool Load(OSTPlatform::DynamicLibrary::ModuleHandle module, const std::string& d
     return false;
 }
 
-void* FindPattern(OSTPlatform::DynamicLibrary::ModuleHandle module, const char* funcName)
+void* FindPattern(OSTPlatform::DynamicLibrary::ModuleHandle module, const char* funcName, bool required)
 {
     {
         std::shared_lock lock(g_patternMutex);
@@ -254,8 +254,10 @@ void* FindPattern(OSTPlatform::DynamicLibrary::ModuleHandle module, const char* 
         if (mapIt == g_moduleMaps.end()) {
             LOG_WARN("PatternLoader: FindPattern called for module that was never loaded ('{}')", funcName);
             lock.unlock();
-            std::unique_lock wlock(g_patternMutex);
-            g_missingFunctions.insert(funcName);
+            if (required) {
+                std::unique_lock wlock(g_patternMutex);
+                g_missingFunctions.insert(funcName);
+            }
             return nullptr;
         }
 
@@ -334,9 +336,13 @@ void* FindPattern(OSTPlatform::DynamicLibrary::ModuleHandle module, const char* 
         }
     }
 
-    LOG_WARN("PatternLoader: no entry for '{}' (key=0x{:08X})", funcName, key);
-    std::unique_lock lock(g_patternMutex);
-    g_missingFunctions.insert(funcName);
+    if (required) {
+        LOG_WARN("PatternLoader: no entry for '{}' (key=0x{:08X})", funcName, key);
+        std::unique_lock lock(g_patternMutex);
+        g_missingFunctions.insert(funcName);
+    } else {
+        LOG_DEBUG("PatternLoader: optional entry '{}' not found (key=0x{:08X}), skipping hook", funcName, key);
+    }
     return nullptr;
 }
 

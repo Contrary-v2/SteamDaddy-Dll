@@ -76,6 +76,21 @@
 #define INSTALL_HOOK_C(name)            INSTALL_HOOK(client_hModule, name)
 #define INSTALL_HOOK_U(name)            INSTALL_HOOK(ui_hModule, name)
 
+#define INSTALL_HOOK_OPTIONAL(module, name)                                \
+    do {                                                                   \
+        void* _ost_hook_target_ptr_ = PatternLoader::FindPattern(module, #name, false); \
+        if (_ost_hook_target_ptr_) {                                       \
+            o##name = reinterpret_cast<name##_t>(_ost_hook_target_ptr_);   \
+            if (!OSTPlatform::Detour::Attach(reinterpret_cast<void**>(&o##name), reinterpret_cast<void*>(hk##name))) { \
+                o##name = nullptr;                                         \
+                _ost_detour_transaction_ok_ = false;                       \
+            }                                                              \
+        }                                                                  \
+    } while (0)
+
+#define INSTALL_HOOK_OPTIONAL_C(name)   INSTALL_HOOK_OPTIONAL(client_hModule, name)
+#define INSTALL_HOOK_OPTIONAL_U(name)   INSTALL_HOOK_OPTIONAL(ui_hModule, name)
+
 // ── uninstall ───────────────────────────────────────────────────
 // Call between UNHOOK_BEGIN / UNHOOK_END.
 #define UNINSTALL_HOOK(name)                                               \

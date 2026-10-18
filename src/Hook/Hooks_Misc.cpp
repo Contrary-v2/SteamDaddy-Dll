@@ -202,8 +202,8 @@ namespace Hooks_Misc {
         HOOK_BEGIN();
         INSTALL_HOOK_C(BuildSpawnEnvBlock);
         INSTALL_HOOK_C(OptedInMask);
-        INSTALL_HOOK_C(GetRedirectedAppId);
-        INSTALL_HOOK_C(RemoteStorage_ResolvePath);
+        INSTALL_HOOK_OPTIONAL_C(GetRedirectedAppId);
+        INSTALL_HOOK_OPTIONAL_C(RemoteStorage_ResolvePath);
         HOOK_END();
     }
 
