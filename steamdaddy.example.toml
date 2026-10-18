@@ -153,7 +153,10 @@ enabled = false
 # library = "cloud_redirect.dll"
 
 [remote]
-# Optional metadata mirror order: "gh-proxy-first" (default) or "github-first"
-order = "gh-proxy-first"
+# Optional metadata mirror order: "jsdelivr-first" (default: fastest CDN), "github-first", or "gh-proxy-first"
+order = "jsdelivr-first"
 # url_template: Optional custom metadata mirror. Must include {channel}, {component}, and {sha256}.
-# url_template = "https://your.server/{channel}/{component}/{sha256}.toml"
+# When set, this custom URL is queried first before falling back to mmxlyo / madoiscool / hazre mirrors.
+# Example:
+# url_template = "https://raw.githubusercontent.com/mmxlyo/steam-monitor/{channel}/{component}/{sha256}.toml"
+

@@ -26,7 +26,7 @@ namespace {
         std::string logDir;
         std::vector<std::string> luaPaths;
         std::string remoteUrlTemplate;
-        std::string remoteOrder = "gh-proxy-first";
+        std::string remoteOrder = "jsdelivr-first";
         bool statsEnableApi = true;
         std::vector<InjectDll> injectDlls;
         CloudSettings cloud;
@@ -45,7 +45,7 @@ namespace {
     std::string logDir;
     std::vector<std::string> luaPaths;
     std::string remoteUrlTemplate;
-    std::string remoteOrder = "gh-proxy-first";
+    std::string remoteOrder = "jsdelivr-first";
     bool statsEnableApi = true;
     std::vector<InjectDll> injectDlls;
     bool cloudEnabled = false;
@@ -98,6 +98,7 @@ namespace {
         logDir                 = snapshot.logDir;
         luaPaths               = snapshot.luaPaths;
         remoteUrlTemplate      = snapshot.remoteUrlTemplate;
+        remoteOrder            = snapshot.remoteOrder;
         statsEnableApi         = snapshot.statsEnableApi;
         injectDlls             = snapshot.injectDlls;
         cloudEnabled           = snapshot.cloud.enabled;

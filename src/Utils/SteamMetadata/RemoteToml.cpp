@@ -16,11 +16,34 @@
 namespace RemoteToml {
 
 namespace {
-    // Upstream pattern repository: hazre/steam-monitor (stable + beta tracks)
-    constexpr const char* kGithubTemplate =
+    // Upstream pattern repositories:
+    // 1. mmxlyo/steam-monitor: full signature coverage (including GetRedirectedAppId & RemoteStorage_ResolvePath)
+    // 2. madoiscool/steam-monitor: automated mirror fallback
+    // 3. hazre/steam-monitor: original OpenSteamTool pattern branch
+    constexpr const char* kMmxlyoJsdelivrTemplate =
+        "https://cdn.jsdelivr.net/gh/mmxlyo/steam-monitor@{channel}/{component}/{sha256}.toml";
+    constexpr const char* kMmxlyoGithubTemplate =
+        "https://raw.githubusercontent.com/mmxlyo/steam-monitor/"
+        "{channel}/{component}/{sha256}.toml";
+    constexpr const char* kMmxlyoGhProxyTemplate =
+        "https://gh-proxy.com/https://raw.githubusercontent.com/mmxlyo/steam-monitor/"
+        "{channel}/{component}/{sha256}.toml";
+
+    constexpr const char* kMadoiscoolJsdelivrTemplate =
+        "https://cdn.jsdelivr.net/gh/madoiscool/steam-monitor@{channel}/{component}/{sha256}.toml";
+    constexpr const char* kMadoiscoolGithubTemplate =
+        "https://raw.githubusercontent.com/madoiscool/steam-monitor/"
+        "{channel}/{component}/{sha256}.toml";
+    constexpr const char* kMadoiscoolGhProxyTemplate =
+        "https://gh-proxy.com/https://raw.githubusercontent.com/madoiscool/steam-monitor/"
+        "{channel}/{component}/{sha256}.toml";
+
+    constexpr const char* kHazreJsdelivrTemplate =
+        "https://cdn.jsdelivr.net/gh/hazre/steam-monitor@main/{channel}/{component}/{sha256}.toml";
+    constexpr const char* kHazreGithubTemplate =
         "https://raw.githubusercontent.com/hazre/steam-monitor/"
         "main/{channel}/{component}/{sha256}.toml";
-    constexpr const char* kGhProxyTemplate =
+    constexpr const char* kHazreGhProxyTemplate =
         "https://gh-proxy.com/https://raw.githubusercontent.com/hazre/steam-monitor/"
         "main/{channel}/{component}/{sha256}.toml";
 
@@ -59,19 +82,62 @@ namespace {
 
     static std::vector<std::string> BuildUrlTemplates()
     {
-        const std::string remoteUrlTemplate = Config::GetRemoteUrlTemplate();
-        if (!remoteUrlTemplate.empty()) {
-            if (!IsValidTemplate(remoteUrlTemplate)) {
+        std::vector<std::string> templates;
+
+        const std::string customTemplate = Config::GetRemoteUrlTemplate();
+        if (!customTemplate.empty()) {
+            if (IsValidTemplate(customTemplate)) {
+                templates.push_back(customTemplate);
+            } else {
                 LOG_WARN("RemoteToml: remote.url_template must contain "
-                         "{channel}, {component}, and {sha256}; remote fetch disabled");
-                return {};
+                         "{channel}, {component}, and {sha256}; skipping invalid custom template");
             }
-            return { remoteUrlTemplate };
         }
 
-        if (Config::GetRemoteOrder() == "github-first")
-            return { kGithubTemplate, kGhProxyTemplate };
-        return { kGhProxyTemplate, kGithubTemplate };
+        const std::string order = Config::GetRemoteOrder();
+        if (order == "github-first") {
+            // mmxlyo primary
+            templates.push_back(kMmxlyoGithubTemplate);
+            templates.push_back(kMmxlyoJsdelivrTemplate);
+            templates.push_back(kMmxlyoGhProxyTemplate);
+            // madoiscool fallback
+            templates.push_back(kMadoiscoolGithubTemplate);
+            templates.push_back(kMadoiscoolJsdelivrTemplate);
+            templates.push_back(kMadoiscoolGhProxyTemplate);
+            // hazre fallback
+            templates.push_back(kHazreGithubTemplate);
+            templates.push_back(kHazreJsdelivrTemplate);
+            templates.push_back(kHazreGhProxyTemplate);
+        } else if (order == "gh-proxy-first") {
+            // mmxlyo primary
+            templates.push_back(kMmxlyoGhProxyTemplate);
+            templates.push_back(kMmxlyoJsdelivrTemplate);
+            templates.push_back(kMmxlyoGithubTemplate);
+            // madoiscool fallback
+            templates.push_back(kMadoiscoolGhProxyTemplate);
+            templates.push_back(kMadoiscoolJsdelivrTemplate);
+            templates.push_back(kMadoiscoolGithubTemplate);
+            // hazre fallback
+            templates.push_back(kHazreGhProxyTemplate);
+            templates.push_back(kHazreJsdelivrTemplate);
+            templates.push_back(kHazreGithubTemplate);
+        } else {
+            // jsdelivr-first (default: fastest global CDN edge distribution)
+            // mmxlyo primary
+            templates.push_back(kMmxlyoJsdelivrTemplate);
+            templates.push_back(kMmxlyoGithubTemplate);
+            templates.push_back(kMmxlyoGhProxyTemplate);
+            // madoiscool fallback
+            templates.push_back(kMadoiscoolJsdelivrTemplate);
+            templates.push_back(kMadoiscoolGithubTemplate);
+            templates.push_back(kMadoiscoolGhProxyTemplate);
+            // hazre fallback
+            templates.push_back(kHazreJsdelivrTemplate);
+            templates.push_back(kHazreGithubTemplate);
+            templates.push_back(kHazreGhProxyTemplate);
+        }
+
+        return templates;
     }
 
     static bool ValidateTomlContent(std::string_view body, std::string* outError = nullptr)
