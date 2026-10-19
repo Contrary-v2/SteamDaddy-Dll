@@ -2,7 +2,6 @@
 #include "AppInfoParser.h"
 #include "I18n.h"
 #include "Log.h"
-#include "LuaFallbackParser.h"
 #include "RaiiGuards.h"
 #include "TuiEngine.h"
 #include "Utils.h"
@@ -353,50 +352,23 @@ std::vector<DepotKeyInfo> ExtractDepotDecryptionKeys(
 
     auto allDepotKeys = !steamPath.empty() ? ParseConfigVdfDepotKeys(steamPath) : std::unordered_map<uint32_t, std::string>{};
 
-    const LuaFallbackData luaFallback = ParseLuaFallbackData(steamPath, appId);
-    if (!luaFallback.Empty()) {
-        for (uint32_t dlcId : luaFallback.dlcIds) {
-            if (dlcId != appId && !knownDlcIds.contains(dlcId)) {
-                knownDlcIds.insert(dlcId);
-                depotToDlc.try_emplace(dlcId, dlcId);
-                DlcInfo& d = dlcMap[dlcId];
-                d.dlcId = dlcId;
-                auto itN = luaFallback.dlcNames.find(dlcId);
-                if (itN != luaFallback.dlcNames.end() && !itN->second.empty()) {
-                    d.name = itN->second;
-                }
-                knownDepotManifests.try_emplace(dlcId, "");
-            }
-        }
-
-        for (const auto& [dId, dlcId] : luaFallback.depotToDlc) {
-            depotToDlc.try_emplace(dId, dlcId);
-        }
-
-        for (const auto& [dId, man] : luaFallback.depotManifests) {
-            if (!knownDepotManifests.contains(dId) || knownDepotManifests[dId].empty()) {
-                knownDepotManifests[dId] = man;
-            }
-        }
-
-        for (const auto& [dId, key] : luaFallback.depotKeys) {
-            if (!allDepotKeys.contains(dId) || allDepotKeys[dId].empty()) {
-                allDepotKeys[dId] = key;
-            }
-        }
-
-    }
-
     if (!steamPath.empty()) {
         auto appInfoOpt = ParseAppInfoDepots(steamPath, appId);
         if (appInfoOpt) {
-            for (uint32_t dlcId : appInfoOpt->dlcAppIds) {
-                if (dlcId != appId && !knownDlcIds.contains(dlcId)) {
-                    knownDlcIds.insert(dlcId);
-                    depotToDlc.try_emplace(dlcId, dlcId);
-                    DlcInfo& d = dlcMap[dlcId];
-                    d.dlcId = dlcId;
-                    knownDepotManifests.try_emplace(dlcId, "");
+            // 仅对本体及已确认拥有的 DLC 补充官方清单 GID，严禁将全量商店公共商品目录 (listofdlc) 倒灌入已拥有列表
+            for (const auto& dInfo : appInfoOpt->depots) {
+                const bool isBaseGameDepot = (dInfo.dlcId == 0 || dInfo.dlcId == appId);
+                const bool isOwnedDlcDepot = (dInfo.dlcId > 0 && knownDlcIds.contains(dInfo.dlcId));
+                if (isBaseGameDepot || isOwnedDlcDepot) {
+                    if (!dInfo.manifestId.empty()) {
+                        auto it = knownDepotManifests.find(dInfo.depotId);
+                        if (it == knownDepotManifests.end() || it->second.empty()) {
+                            knownDepotManifests[dInfo.depotId] = dInfo.manifestId;
+                        }
+                    }
+                    if (isOwnedDlcDepot) {
+                        depotToDlc.try_emplace(dInfo.depotId, dInfo.dlcId);
+                    }
                 }
             }
         }
@@ -506,17 +478,6 @@ std::vector<DepotKeyInfo> ExtractDepotDecryptionKeys(
         auto depotcacheDirs = GetDepotcacheDirs(steamPath, libraries);
         for (auto& dk : result) {
             dk.manifestFilePath = FindDepotManifestFile(depotcacheDirs, dk.depotId, dk.manifestId);
-        }
-    }
-
-    if (!luaFallback.Empty()) {
-        for (auto& dk : result) {
-            if (dk.manifestFilePath.empty()) {
-                auto itMf = luaFallback.manifestFiles.find(dk.depotId);
-                if (itMf != luaFallback.manifestFiles.end()) {
-                    dk.manifestFilePath = itMf->second;
-                }
-            }
         }
     }
 

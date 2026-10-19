@@ -1,7 +1,6 @@
 #include "AppInfoParser.h"
 #include "I18n.h"
 #include "Log.h"
-#include "LuaFallbackParser.h"
 #include "OnlineSession.h"
 #include "OutputWriter.h"
 #include "RaiiGuards.h"
@@ -103,13 +102,6 @@ WorkerExitCode ExtractLocalApp(uint32_t appId, bool forceEticket, bool inTui = f
             targetAppIds.insert(dlc.dlcId);
         }
         appTokens = ParseAppInfoTokens(steamPath, &targetAppIds);
-    }
-
-    const auto luaFallback = ParseLuaFallbackData(steamPath, appId);
-    for (const auto& [tId, tVal] : luaFallback.appTokens) {
-        if (tVal != 0) {
-            appTokens.try_emplace(tId, tVal);
-        }
     }
 
     // Substantive Payload Guard: reject empty shells before touching disk I/O

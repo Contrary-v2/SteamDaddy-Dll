@@ -293,81 +293,106 @@ bool WriteOutputs(uint32_t appId,
             }
         }
 
-        std::format_to(std::back_inserter(luaText), "\n{}\n", TR(MsgKey::LuaOwnedDlcs));
+        std::vector<size_t> physicalDlcIndices;
+        std::vector<size_t> logicalDlcIndices;
+        physicalDlcIndices.reserve(dlcs.size());
+        logicalDlcIndices.reserve(dlcs.size());
+
         for (size_t i = 0; i < dlcs.size(); ++i) {
             const auto& dlc = dlcs[i];
             const auto& data = dlcDepotList[i];
 
-            bool isDepotIncomplete = false;
             bool hasPhysicalDepot = false;
             for (const auto* dk : data.associatedDepots) {
                 if (IsValidManifestId(dk->manifestId)) {
                     hasPhysicalDepot = true;
-                    const bool manifestPresent = hasManifestOnDisk(dk->depotId, dk->manifestId);
-                    if (!manifestPresent) {
-                        isDepotIncomplete = true;
+                    break;
+                }
+            }
+
+            if (hasPhysicalDepot) {
+                physicalDlcIndices.push_back(i);
+            } else {
+                // 纵深防御：对于既无物理实体又无公开名称的孤立空项直接跳过
+                if (dlc.name.empty()) {
+                    LOG_DEBUG("OutputWriter", MsgKey::LogOutDroppedOrphanGhostDlc, dlc.dlcId);
+                    continue;
+                }
+                logicalDlcIndices.push_back(i);
+            }
+        }
+
+        // 3. Owned Physical DLCs Unlocks
+        if (!physicalDlcIndices.empty()) {
+            std::format_to(std::back_inserter(luaText), "\n{}\n", TR(MsgKey::LuaOwnedDlcs));
+            for (size_t idx : physicalDlcIndices) {
+                const auto& dlc = dlcs[idx];
+                const auto& data = dlcDepotList[idx];
+
+                bool missingKey = false;
+                for (const auto* dk : data.associatedDepots) {
+                    if (IsValidManifestId(dk->manifestId) && dk->hexKey.empty()) {
+                        missingKey = true;
                         break;
                     }
                 }
-            }
-            if (!hasPhysicalDepot) {
-                isDepotIncomplete = false; // Pure logical DLC: zero physical files on CDN, always active
-            }
 
-            // 纵深防御：对于既无物理实体又无公开名称的孤立空项直接跳过
-            if (!hasPhysicalDepot && dlc.name.empty()) {
-                LOG_DEBUG("OutputWriter", MsgKey::LogOutDroppedOrphanGhostDlc, dlc.dlcId);
-                continue;
-            }
+                const std::string_view prefix = missingKey ? "-- " : "";
+                const std::string reasonSuffix = missingKey ? (" -- " + std::string(TR(MsgKey::LuaDepotKeyMissing))) : "";
 
-            const std::string_view prefix = isDepotIncomplete ? "-- " : "";
-            const std::string reasonSuffix = isDepotIncomplete ? (" -- " + std::string(TR(MsgKey::LuaDlcDepotMissing))) : "";
-
-            if (emitTracker.TryEmitAppId(dlc.dlcId)) {
-                if (data.dlcDk && !data.dlcDk->hexKey.empty()) {
-                    std::format_to(std::back_inserter(luaText), "{}addappid({}, 1, \"{}\")", prefix, dlc.dlcId, data.dlcDk->hexKey);
-                } else {
-                    std::format_to(std::back_inserter(luaText), "{}addappid({}, 1)", prefix, dlc.dlcId);
-                }
-
-                if (!dlc.name.empty()) {
-                    luaText += " -- " + SanitizeComment(dlc.name);
-                }
-                luaText += reasonSuffix + "\n";
-            } else {
-                LOG_DEBUG("OutputWriter", MsgKey::LogOutDeduplicatedAppId, dlc.dlcId);
-            }
-
-            auto dlcTokIt = appTokens.find(dlc.dlcId);
-            if (dlcTokIt != appTokens.end() && dlcTokIt->second != 0 && emitTracker.TryEmitToken(dlc.dlcId)) {
-                std::format_to(std::back_inserter(luaText), "{}addtoken({}, \"{}\")\n", prefix, dlc.dlcId, dlcTokIt->second);
-            }
-
-            // Any subdepots of this DLC with keys
-            for (const auto* subDk : data.subDepots) {
-                if (!subDk->hexKey.empty()) {
-                    if (emitTracker.TryEmitAppId(subDk->depotId)) {
-                        std::format_to(std::back_inserter(luaText), "{}addappid({}, 1, \"{}\"){}\n", prefix, subDk->depotId, subDk->hexKey, reasonSuffix);
+                if (emitTracker.TryEmitAppId(dlc.dlcId)) {
+                    if (data.dlcDk && !data.dlcDk->hexKey.empty()) {
+                        std::format_to(std::back_inserter(luaText), "{}addappid({}, 1, \"{}\")", prefix, dlc.dlcId, data.dlcDk->hexKey);
                     } else {
-                        LOG_DEBUG("OutputWriter", MsgKey::LogOutDeduplicatedAppId, subDk->depotId);
+                        std::format_to(std::back_inserter(luaText), "{}addappid({}, 1)", prefix, dlc.dlcId);
+                    }
+
+                    if (!dlc.name.empty()) {
+                        luaText += " -- " + SanitizeComment(dlc.name);
+                    }
+                    luaText += reasonSuffix + "\n";
+                } else {
+                    LOG_DEBUG("OutputWriter", MsgKey::LogOutDeduplicatedAppId, dlc.dlcId);
+                }
+
+                auto dlcTokIt = appTokens.find(dlc.dlcId);
+                if (dlcTokIt != appTokens.end() && dlcTokIt->second != 0 && emitTracker.TryEmitToken(dlc.dlcId)) {
+                    std::format_to(std::back_inserter(luaText), "{}addtoken({}, \"{}\")\n", prefix, dlc.dlcId, dlcTokIt->second);
+                }
+
+                // Any subdepots of this DLC with keys
+                for (const auto* subDk : data.subDepots) {
+                    if (!subDk->hexKey.empty()) {
+                        if (emitTracker.TryEmitAppId(subDk->depotId)) {
+                            std::format_to(std::back_inserter(luaText), "{}addappid({}, 1, \"{}\"){}\n", prefix, subDk->depotId, subDk->hexKey, reasonSuffix);
+                        } else {
+                            LOG_DEBUG("OutputWriter", MsgKey::LogOutDeduplicatedAppId, subDk->depotId);
+                        }
+                    } else if (missingKey) {
+                        if (emitTracker.TryEmitAppId(subDk->depotId)) {
+                            std::format_to(std::back_inserter(luaText), "-- addappid({}, 1){}\n", subDk->depotId, reasonSuffix);
+                        }
                     }
                 }
             }
         }
 
         // 4. DLC Manifests (placed right under DLC unlocks)
-        if (hasDlcManifests) {
+        if (hasDlcManifests && !physicalDlcIndices.empty()) {
             std::format_to(std::back_inserter(luaText), "\n{}\n", TR(MsgKey::LuaDlcManifests));
-            for (size_t i = 0; i < dlcs.size(); ++i) {
-                const auto& dlc = dlcs[i];
-                const auto& data = dlcDepotList[i];
+            for (size_t idx : physicalDlcIndices) {
+                const auto& dlc = dlcs[idx];
+                const auto& data = dlcDepotList[idx];
 
                 // DLC itself manifest
                 if (data.dlcDk && IsValidManifestId(data.dlcDk->manifestId)) {
                     if (emitTracker.TryEmitManifest(data.dlcDk->depotId)) {
+                        const bool hasKey = !data.dlcDk->hexKey.empty();
                         const bool onDisk = hasManifestOnDisk(data.dlcDk->depotId, data.dlcDk->manifestId);
-                        if (onDisk) {
+                        if (hasKey && onDisk) {
                             std::format_to(std::back_inserter(luaText), "setManifestid({}, \"{}\")", data.dlcDk->depotId, data.dlcDk->manifestId);
+                        } else if (!hasKey) {
+                            std::format_to(std::back_inserter(luaText), "-- setManifestid({}, \"{}\") -- {}", data.dlcDk->depotId, data.dlcDk->manifestId, TR(MsgKey::LuaDepotKeyMissing));
                         } else {
                             std::format_to(std::back_inserter(luaText), "-- setManifestid({}, \"{}\") -- {}", data.dlcDk->depotId, data.dlcDk->manifestId, TR(MsgKey::LuaManifestMissing));
                         }
@@ -384,9 +409,12 @@ bool WriteOutputs(uint32_t appId,
                 for (const auto* subDk : data.subDepots) {
                     if (IsValidManifestId(subDk->manifestId)) {
                         if (emitTracker.TryEmitManifest(subDk->depotId)) {
+                            const bool hasKey = !subDk->hexKey.empty();
                             const bool onDisk = hasManifestOnDisk(subDk->depotId, subDk->manifestId);
-                            if (onDisk) {
+                            if (hasKey && onDisk) {
                                 std::format_to(std::back_inserter(luaText), "setManifestid({}, \"{}\")\n", subDk->depotId, subDk->manifestId);
+                            } else if (!hasKey) {
+                                std::format_to(std::back_inserter(luaText), "-- setManifestid({}, \"{}\") -- {}\n", subDk->depotId, subDk->manifestId, TR(MsgKey::LuaDepotKeyMissing));
                             } else {
                                 std::format_to(std::back_inserter(luaText), "-- setManifestid({}, \"{}\") -- {}\n", subDk->depotId, subDk->manifestId, TR(MsgKey::LuaManifestMissing));
                             }
@@ -394,6 +422,28 @@ bool WriteOutputs(uint32_t appId,
                             LOG_DEBUG("OutputWriter", MsgKey::LogOutDeduplicatedManifest, subDk->depotId);
                         }
                     }
+                }
+            }
+        }
+
+        // 5. Manifest-free Logical DLCs (pure logic unlocks with zero physical files)
+        if (!logicalDlcIndices.empty()) {
+            std::format_to(std::back_inserter(luaText), "\n{}\n", TR(MsgKey::LuaLogicalDlcs));
+            for (size_t idx : logicalDlcIndices) {
+                const auto& dlc = dlcs[idx];
+                if (emitTracker.TryEmitAppId(dlc.dlcId)) {
+                    std::format_to(std::back_inserter(luaText), "addappid({}, 1)", dlc.dlcId);
+                    if (!dlc.name.empty()) {
+                        luaText += " -- " + SanitizeComment(dlc.name);
+                    }
+                    luaText += "\n";
+                } else {
+                    LOG_DEBUG("OutputWriter", MsgKey::LogOutDeduplicatedAppId, dlc.dlcId);
+                }
+
+                auto dlcTokIt = appTokens.find(dlc.dlcId);
+                if (dlcTokIt != appTokens.end() && dlcTokIt->second != 0 && emitTracker.TryEmitToken(dlc.dlcId)) {
+                    std::format_to(std::back_inserter(luaText), "addtoken({}, \"{}\")\n", dlc.dlcId, dlcTokIt->second);
                 }
             }
         }

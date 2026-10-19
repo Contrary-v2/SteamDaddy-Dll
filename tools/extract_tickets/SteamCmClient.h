@@ -17,6 +17,11 @@
 
 namespace OST::ExtractTickets {
 
+struct DepotKeyQuery {
+    uint32_t depotId{0};
+    uint32_t appId{0};
+};
+
 struct ExtractedAppCredentials {
     uint32_t appId{0};
     std::optional<std::vector<uint8_t>> appOwnershipTicket;
@@ -43,8 +48,13 @@ public:
     // Requests EncryptedAppTicket (eMsg 5527)
     [[nodiscard]] std::optional<std::vector<uint8_t>> RequestEncryptedAppTicket(uint32_t appId);
 
-    // Requests 32-byte AES depot decryption keys for depot IDs (eMsg 5438)
-    [[nodiscard]] std::vector<DepotKeyInfo> RequestDepotKeys(uint32_t appId, const std::vector<uint32_t>& depotIds);
+    // Requests 32-byte AES depot decryption keys for depot queries (eMsg 5438) with two-tier fallback
+    [[nodiscard]] std::vector<DepotKeyInfo> RequestDepotKeys(
+        const std::vector<DepotKeyQuery>& queries, uint32_t fallbackAppId = 0);
+
+    // Backward-compatible overload querying all depots with a single appId
+    [[nodiscard]] std::vector<DepotKeyInfo> RequestDepotKeys(
+        uint32_t appId, const std::vector<uint32_t>& depotIds);
 
     // Requests 64-bit PICS access tokens for app IDs (eMsg 8901)
     [[nodiscard]] std::unordered_map<uint32_t, uint64_t> RequestAppTokens(const std::vector<uint32_t>& appIds);
@@ -52,12 +62,14 @@ public:
     // Requests PICS AppInfo product metadata (eMsg 8903)
     [[nodiscard]] std::optional<ParsedAppInfoData> RequestPicsProductInfo(uint32_t appId, uint64_t accessToken = 0);
 
+    // Batch requests PICS AppInfo product metadata (eMsg 8903)
+    [[nodiscard]] std::vector<ParsedAppInfoData> RequestPicsProductInfoBatch(
+        const std::vector<uint32_t>& appIds,
+        const std::unordered_map<uint32_t, uint64_t>& appTokens = {});
+
     // Fast batch resolution of official app/DLC names via Steam CM PICS (eMsg 8903)
     [[nodiscard]] std::unordered_map<uint32_t, std::string> RequestPicsAppNames(
         const std::vector<uint32_t>& appIds, bool* outSuccess = nullptr);
-
-    // Sets or clears playing state via CMsgClientGamesPlayed (eMsg 742) for session license activation
-    bool SetGamePlayed(uint32_t appId);
 
     // Resolves manifest request code via CM ServiceMethod or legacy RPC
     [[nodiscard]] std::string FetchManifestRequestCode(
@@ -164,7 +176,6 @@ private:
     uint64_t m_nextJobId{100};
     int32_t m_clientSessionId{0};
     uint32_t m_cellId{0};
-    uint32_t m_playingAppId{0};
     int32_t m_lastLogonEResult{1};
     bool m_isLoggedOn{false};
     bool m_reconnecting{false};

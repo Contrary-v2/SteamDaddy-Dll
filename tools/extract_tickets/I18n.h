@@ -22,7 +22,9 @@ inline constexpr size_t kLanguageCount = static_cast<size_t>(Language::COUNT);
     M(LuaManifestMissing, "[Manifest file not present on disk]", "[未检测到本地清单文件]", "[Archivo de manifiesto no encontrado en disco]") \
     M(LuaOwnedDlcs, "-- Owned DLCs", "-- 已拥有 DLC 内容", "-- DLCs Adquiridos") \
     M(LuaDlcDepotMissing, "[Depot key or manifest missing; commented out to avoid download failure]", "[未获取到该 DLC 对应 Depot 的密钥或清单，已注释以避免客户端下载失败]", "[Falta la clave o manifiesto del Depot; comentado para evitar errores de descarga]") \
+    M(LuaDepotKeyMissing, "[Missing decryption key; commented out to avoid download failure]", "[缺少解密密钥，已注释以避免客户端下载失败]", "[Falta la clave de descifrado; comentado para evitar errores de descarga]") \
     M(LuaDlcManifests, "-- DLC Manifests", "-- DLC 清单 (Manifests)", "-- Manifiestos de DLC") \
+    M(LuaLogicalDlcs, "-- Manifest-free DLCs", "-- 无需清单 DLC", "-- DLCs sin manifiesto") \
     M(LuaAppTicket, "-- App Ownership Ticket (AppTicket)", "-- 正版所有权票据 (AppTicket)", "-- Ticket de Propiedad de la Aplicación (AppTicket)") \
     M(LuaAppTicketMissing, "[No valid ownership ticket detected; OpenSteamTool will automatically fall back to AppID 7 spoofing]", "[未检测到有效所有权票据；OpenSteamTool 将自动启用 AppID 7 通用票据兜底]", "[No se detectó ticket de propiedad válido; OpenSteamTool utilizará la suplantación de AppID 7]") \
     M(LuaETicket, "-- Encrypted App Ticket (ETicket)", "-- 加密应用票据 (ETicket)", "-- Ticket Cifrado de Aplicación (ETicket)") \
