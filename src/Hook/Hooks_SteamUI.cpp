@@ -6,6 +6,7 @@
 #include "Utils/Config/Config.h"
 #include "Utils/Config/LuaConfig.h"
 #include "Hook/Hooks_Package.h"
+#include "Hook/Hooks_Misc.h"
 #include "Pipe/PipeManager.h"
 #include "Pipe/Features/DenuvoAuth/DenuvoSync.h"
 #include "OSTPlatform/include/Thread.h"
@@ -583,43 +584,137 @@ namespace
         }
     }
 
+    enum class AppOwnershipCategory : uint8_t {
+        OfficiallyOwned,  // Q1: Native self-purchased / free game
+        FamilyShared,     // Q2: Native family sharing (borrowed from family member)
+        PureOST,          // Q3: Pure OST unlocked asset (via Lua depot config)
+        Other             // Q4: Removed or unowned
+    };
+
+    [[nodiscard]] static AppOwnershipCategory ClassifyAppOwnership(const CSteamApp* pApp, AccountID_t activeId) noexcept
+    {
+        if (!pApp) return AppOwnershipCategory::Other;
+        const AppId_t appId = pApp->nAppID;
+        if (appId == 0 || appId == k_uAppIdInvalid) return AppOwnershipCategory::Other;
+
+        // Principle 1: Officially owned (authoritative based on underlying real purchased package)
+        // Self-purchased games (e.g. 1543030) have absolute priority and 100% native presentation even if in shared pools!
+        if (Hooks_Package::IsAppTrulyOwned(appId))
+        {
+            return AppOwnershipCategory::OfficiallyOwned;
+        }
+
+        // Principle 2: Official family shared (non-owned, meeting underlying official shared license or native shared license evidence)
+        // Family shared games (e.g. 292030 / 2054970) are presented natively except for anti-concurrency lock!
+        const bool isSharedFromPkg = Hooks_Package::IsSharedLicenseCached(appId);
+        const bool hasNativeSharedFlag = (pApp->OwnershipFlags & k_EAppOwnershipFlags_SharedLicense) != 0;
+        const bool isSharedFromNative = hasNativeSharedFlag &&
+                                        (activeId == 0 || (pApp->SteamID.IsValid() && pApp->SteamID.GetAccountID() != activeId));
+        if (isSharedFromPkg || isSharedFromNative)
+        {
+            return AppOwnershipCategory::FamilyShared;
+        }
+
+        // Principle 3: Dropped from library UI (only applicable if neither owned nor shared)
+        if (Hooks_SteamUI::IsRemoved(appId))
+        {
+            return AppOwnershipCategory::Other;
+        }
+
+        // Principle 4: Pure OST unlocked asset (neither owned nor shared, matched in local Lua config)
+        // Standalone OST assets (e.g. 3321460) or extra unowned DLCs added to owned/shared base games
+        if (LuaConfig::HasDepot(appId, false))
+        {
+            return AppOwnershipCategory::PureOST;
+        }
+
+        return AppOwnershipCategory::Other;
+    }
+
     HOOK_FUNC(FillInAppOverview, void *, void *pThis, void *pAppOverview, CSteamApp *pApp)
     {
         if (pApp)
         {
-            if (pApp->OwnershipFlags & k_EAppOwnershipFlags_LicenseLocked)
-            {
-                pApp->OwnershipFlags = static_cast<EAppOwnershipFlags>(
-                    pApp->OwnershipFlags & ~k_EAppOwnershipFlags_LicenseLocked);
-            }
+            const AppId_t appId = pApp->nAppID;
+            const AccountID_t activeId = Hooks_Misc::GetActiveAccountID();
+            const AppOwnershipCategory category = ClassifyAppOwnership(pApp, activeId);
 
-            if (LuaConfig::HasDepot(pApp->nAppID, false))
+            switch (category)
             {
-                constexpr uint32_t kActiveLicenseMask =
+            case AppOwnershipCategory::OfficiallyOwned:
+                // Principle 1: Officially owned games — 100% native official behavior!
+                // Even if present across multiple family shared accounts, preserve native presentation without intervention!
+                LOG_STEAMUI_DEBUG("FillInAppOverview: appId={} Q1(OfficiallyOwned) flags=0x{:X}",
+                                 appId, static_cast<uint32_t>(pApp->OwnershipFlags));
+                return oFillInAppOverview(pThis, pAppOverview, pApp);
+
+            case AppOwnershipCategory::FamilyShared:
+                // Principle 2: Official family shared — completely native presentation except for concurrency lock!
+                // Family borrower banner and lender avatar are 100% native; only clear concurrency lock
+                pApp->OwnershipFlags = static_cast<EAppOwnershipFlags>(
+                    (pApp->OwnershipFlags & ~k_EAppOwnershipFlags_LicenseLocked) | k_EAppOwnershipFlags_SharedLicense
+                );
+                // Dual-guarantee forward sync: immediately persist official sharing to Package cache
+                Hooks_Package::RecordFamilySharedApp(appId);
+                LOG_STEAMUI_DEBUG("FillInAppOverview: appId={} Q2(FamilyShared) flags=0x{:X}",
+                                 appId, static_cast<uint32_t>(pApp->OwnershipFlags));
+                return oFillInAppOverview(pThis, pAppOverview, pApp);
+
+            case AppOwnershipCategory::PureOST:
+            {
+                // Principle 3: Pure OST unlocked asset (or extra unowned DLCs added to official games)
+                // Completely eliminate borrower banner and lender avatars, presenting as standalone owned asset!
+                pApp->OwnershipFlags = static_cast<EAppOwnershipFlags>(
+                    (pApp->OwnershipFlags & ~k_EAppOwnershipFlags_LicenseLocked & ~k_EAppOwnershipFlags_SharedLicense) |
                     k_EAppOwnershipFlags_OwnsLicense |
-                    k_EAppOwnershipFlags_FreeLicense |
-                    k_EAppOwnershipFlags_SharedLicense;
-                if ((pApp->OwnershipFlags & kActiveLicenseMask) == 0)
+                    k_EAppOwnershipFlags_LicensePermanent
+                );
+
+                // Origin contract: bind to active logged-in account so currentUser.strSteamID == strOwnerSteamID
+                if (activeId != 0)
                 {
-                    pApp->OwnershipFlags = static_cast<EAppOwnershipFlags>(
-                        pApp->OwnershipFlags | k_EAppOwnershipFlags_OwnsLicense | k_EAppOwnershipFlags_LicensePermanent);
+                    pApp->SteamID.Set(activeId, k_EUniversePublic, k_EAccountTypeIndividual);
                 }
-                uint32_t t = LuaConfig::GetPurchaseTime(pApp->nAppID);
-                if (t)
+                else
+                {
+                    pApp->SteamID.SetFromUint64(0);
+                }
+
+                const uint32_t t = LuaConfig::GetPurchaseTime(appId);
+                if (t != 0)
                 {
                     pApp->PurchasedTime = t;
-                    LOG_STEAMUI_TRACE("FillInAppOverview: set PurchasedTime={} for appId={}",
-                                      pApp->PurchasedTime, pApp->nAppID);
                 }
+
+                LOG_STEAMUI_DEBUG("FillInAppOverview: appId={} Q3(PureOST) flags=0x{:X}",
+                                 appId, static_cast<uint32_t>(pApp->OwnershipFlags));
+                void* res = oFillInAppOverview(pThis, pAppOverview, pApp);
+
+                // Pure OST asset deep sanitization (output dual-guarantee):
+                // In Valve native contract, owned assets have unset owner_account_id.
+                // Clear any residual lender account ID and reset copy count to 1.
+                if (pAppOverview)
+                {
+                    auto* pOverview = static_cast<CAppOverview*>(pAppOverview);
+                    if (pOverview->has_owner_account_id())
+                    {
+                        pOverview->clear_owner_account_id();
+                    }
+                    pOverview->set_number_of_copies(1);
+                }
+                return res;
             }
-            else
-            {
-                if (Hooks_SteamUI::IsRemoved(pApp->nAppID) && !Hooks_Package::HasValidLicense(pApp->nAppID))
+
+            case AppOwnershipCategory::Other:
+            default:
+                if (Hooks_SteamUI::IsRemoved(appId))
                 {
                     pApp->OwnershipFlags = k_EAppOwnershipFlags_None;
                     pApp->PurchasedTime = 0;
                     pApp->MasterSubAppID = 0;
+                    LOG_STEAMUI_DEBUG("FillInAppOverview: appId={} Q4(Removed)", appId);
                 }
+                break;
             }
         }
 
@@ -678,66 +773,84 @@ namespace
             if (!drainingAdditions.empty())
             {
                 std::unordered_set<AppId_t> parentsToNotify;
+                const AccountID_t activeId = Hooks_Misc::GetActiveAccountID();
 
                 for (AppId_t appId : drainingAdditions)
                 {
                     if (CSteamApp *pApp = oGetAppByID(g_pController, appId, false))
                     {
-                        if (pApp->OwnershipFlags & k_EAppOwnershipFlags_LicenseLocked)
-                        {
-                            pApp->OwnershipFlags = static_cast<EAppOwnershipFlags>(
-                                pApp->OwnershipFlags & ~k_EAppOwnershipFlags_LicenseLocked);
-                        }
-                        constexpr uint32_t kActiveLicenseMask =
-                            k_EAppOwnershipFlags_OwnsLicense |
-                            k_EAppOwnershipFlags_FreeLicense |
-                            k_EAppOwnershipFlags_SharedLicense;
-                        if ((pApp->OwnershipFlags & kActiveLicenseMask) == 0)
-                        {
-                            pApp->OwnershipFlags = static_cast<EAppOwnershipFlags>(
-                                pApp->OwnershipFlags | k_EAppOwnershipFlags_OwnsLicense | k_EAppOwnershipFlags_LicensePermanent);
-                        }
+                        const AppOwnershipCategory category = ClassifyAppOwnership(pApp, activeId);
 
-                        uint32_t t = LuaConfig::GetPurchaseTime(appId);
-                        if (t)
+                        if (category == AppOwnershipCategory::PureOST)
                         {
-                            pApp->PurchasedTime = t;
+                            // Only establish owned asset flags in SteamUI for genuine pure OST assets (neither owned nor shared)
+                            pApp->OwnershipFlags = static_cast<EAppOwnershipFlags>(
+                                (pApp->OwnershipFlags & ~k_EAppOwnershipFlags_LicenseLocked & ~k_EAppOwnershipFlags_SharedLicense) |
+                                k_EAppOwnershipFlags_OwnsLicense |
+                                k_EAppOwnershipFlags_LicensePermanent
+                            );
+                            if (activeId != 0)
+                            {
+                                pApp->SteamID.Set(activeId, k_EUniversePublic, k_EAccountTypeIndividual);
+                            }
+                            else
+                            {
+                                pApp->SteamID.SetFromUint64(0);
+                            }
+                            const uint32_t t = LuaConfig::GetPurchaseTime(appId);
+                            if (t != 0)
+                            {
+                                pApp->PurchasedTime = t;
+                            }
                         }
+                        else if (category == AppOwnershipCategory::FamilyShared)
+                        {
+                            // Family shared: preserve SteamID and borrower status, only clear concurrency lock
+                            pApp->OwnershipFlags = static_cast<EAppOwnershipFlags>(
+                                (pApp->OwnershipFlags & ~k_EAppOwnershipFlags_LicenseLocked) | k_EAppOwnershipFlags_SharedLicense
+                            );
+                        }
+                        // category == OfficiallyOwned: Officially owned, zero intervention!
 
                         const bool isDlc = ((pApp->eProtoAppType & 32) != 0) ||
                                            (pApp->ParentAppID != 0 && pApp->ParentAppID != k_uAppIdInvalid);
-
                         if (isDlc)
                         {
+                            pApp->OwnershipFlags = static_cast<EAppOwnershipFlags>(
+                                pApp->OwnershipFlags | k_EAppOwnershipFlags_OwnsLicense);
                             if (pApp->ParentAppID != 0 && pApp->ParentAppID != k_uAppIdInvalid && pApp->ParentAppID != appId)
                             {
                                 parentsToNotify.insert(pApp->ParentAppID);
                             }
                         }
-                    }
 
-                    LOG_STEAMUI_TRACE("RunFrame: restoring added appId {}", appId);
-                    oMarkAppChange(g_pAppChangeSource, appId, EAppChangeFlags::AppInfoOrConfig);
+                        LOG_STEAMUI_TRACE("RunFrame: restoring added appId {}", appId);
+                        oMarkAppChange(g_pAppChangeSource, appId, EAppChangeFlags::AppInfoOrConfig);
+                    }
                 }
 
                 LOG_STEAMUI_DEBUG("RunFrame: restored {} pending Lua additions to SteamUI", drainingAdditions.size());
 
                 for (AppId_t parentId : parentsToNotify)
                 {
-                    LOG_STEAMUI_INFO("RunFrame: notifying parent appId {} of DLC addition", parentId);
-                    oMarkAppChange(g_pAppChangeSource, parentId, EAppChangeFlags::AppInfoOrConfig);
+                    if (oGetAppByID(g_pController, parentId, false))
+                    {
+                        LOG_STEAMUI_INFO("RunFrame: notifying parent appId {} of DLC addition", parentId);
+                        oMarkAppChange(g_pAppChangeSource, parentId, EAppChangeFlags::AppInfoOrConfig);
+                    }
                 }
             }
 
             if (!drainingRemovals.empty())
             {
                 std::unordered_set<AppId_t> parentsToNotify;
+                const AccountID_t activeId = Hooks_Misc::GetActiveAccountID();
 
                 for (AppId_t appId : drainingRemovals)
                 {
-                    if (Hooks_Package::HasValidLicense(appId) || LuaConfig::HasDepot(appId, false))
+                    if (LuaConfig::HasDepot(appId, false) || LuaConfig::IsOwned(appId))
                     {
-                        LOG_STEAMUI_DEBUG("RunFrame: appId {} is still licensed (owned/shared) or active in config, skipping removal", appId);
+                        LOG_STEAMUI_DEBUG("RunFrame: appId {} is still configured in lua, skipping removal", appId);
                         std::lock_guard<std::mutex> lock(g_removalMutex);
                         g_removedAppIds->erase(appId);
                         g_hasRemovedAppIds.store(!g_removedAppIds->empty(), std::memory_order_release);
@@ -746,13 +859,30 @@ namespace
 
                     if (CSteamApp *pApp = oGetAppByID(g_pController, appId, false))
                     {
+                        const AppOwnershipCategory category = ClassifyAppOwnership(pApp, activeId);
+                        if (category == AppOwnershipCategory::OfficiallyOwned || category == AppOwnershipCategory::FamilyShared)
+                        {
+                            if (category == AppOwnershipCategory::FamilyShared)
+                            {
+                                pApp->OwnershipFlags = static_cast<EAppOwnershipFlags>(
+                                    (pApp->OwnershipFlags & ~k_EAppOwnershipFlags_LicenseLocked) | k_EAppOwnershipFlags_SharedLicense
+                                );
+                                Hooks_Package::RecordFamilySharedApp(appId);
+                            }
+                            std::lock_guard<std::mutex> lock(g_removalMutex);
+                            g_removedAppIds->erase(appId);
+                            g_hasRemovedAppIds.store(!g_removedAppIds->empty(), std::memory_order_release);
+                            LOG_STEAMUI_INFO("RunFrame: preserved official appId {} from removal", appId);
+                            oMarkAppChange(g_pAppChangeSource, appId, EAppChangeFlags::AppInfoOrConfig);
+                            continue;
+                        }
+
                         pApp->OwnershipFlags = k_EAppOwnershipFlags_None;
                         pApp->PurchasedTime = 0;
                         pApp->MasterSubAppID = 0;
 
                         const bool isDlc = ((pApp->eProtoAppType & 32) != 0) ||
                                            (pApp->ParentAppID != 0 && pApp->ParentAppID != k_uAppIdInvalid);
-
                         if (isDlc)
                         {
                             if (pApp->ParentAppID != 0 && pApp->ParentAppID != k_uAppIdInvalid && pApp->ParentAppID != appId)
@@ -760,6 +890,9 @@ namespace
                                 parentsToNotify.insert(pApp->ParentAppID);
                             }
                         }
+
+                        LOG_STEAMUI_INFO("RunFrame: removing appId {}", appId);
+                        oMarkAppChange(g_pAppChangeSource, appId, EAppChangeFlags::AppInfoOrConfig);
                     }
 
                     {
@@ -767,15 +900,15 @@ namespace
                         g_removedAppIds->insert(appId);
                         g_hasRemovedAppIds.store(true, std::memory_order_release);
                     }
-
-                    LOG_STEAMUI_INFO("RunFrame: removing appId {}", appId);
-                    oMarkAppChange(g_pAppChangeSource, appId, EAppChangeFlags::AppInfoOrConfig);
                 }
 
                 for (AppId_t parentId : parentsToNotify)
                 {
-                    LOG_STEAMUI_INFO("RunFrame: notifying parent appId {} of DLC change", parentId);
-                    oMarkAppChange(g_pAppChangeSource, parentId, EAppChangeFlags::AppInfoOrConfig);
+                    if (oGetAppByID(g_pController, parentId, false))
+                    {
+                        LOG_STEAMUI_INFO("RunFrame: notifying parent appId {} of DLC change", parentId);
+                        oMarkAppChange(g_pAppChangeSource, parentId, EAppChangeFlags::AppInfoOrConfig);
+                    }
                 }
             }
 
@@ -810,10 +943,22 @@ namespace Hooks_SteamUI
         g_activeUpdatingApps->reserve(16);
         g_autoSyncWorkerPool->Start();
         g_installedScannerPool->Start();
+
+        Hooks_Package::SetLicenseChangeObserver([](std::span<const AppId_t> additions, std::span<const AppId_t> removals) {
+            if (!additions.empty()) {
+                QueueAdditions(additions);
+            }
+            for (AppId_t id : removals) {
+                if (!Hooks_Package::HasValidLicense(id)) {
+                    QueueRemoval(id);
+                }
+            }
+        });
     }
 
     void Uninstall()
     {
+        Hooks_Package::SetLicenseChangeObserver(nullptr);
         g_installedScannerPool->Stop();
         g_autoSyncWorkerPool->Stop();
         g_trackedStates->clear();

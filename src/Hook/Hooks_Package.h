@@ -1,3 +1,4 @@
+#include <span>
 #pragma once
 
 #include "Steam/Types.h"
@@ -24,4 +25,12 @@ namespace Hooks_Package {
 
     // Returns true if the account either genuinely owns the license or has a valid family shared license.
     [[nodiscard]] bool HasValidLicense(AppId_t appId);
+
+    // Observer callback: invoked when active packages/depots change in Lua configuration
+    using LicenseChangeObserver = void(*)(std::span<const AppId_t> additions, std::span<const AppId_t> removals);
+    void SetLicenseChangeObserver(LicenseChangeObserver observer) noexcept;
+
+    // Fast-path lockless check if an AppId is recognized as family-shared from official packages
+    [[nodiscard]] bool IsSharedLicenseCached(AppId_t appId) noexcept;
+    void RecordFamilySharedApp(AppId_t appId);
 }

@@ -61,9 +61,9 @@ namespace {
                 auto it = overrides.find(e.DepotId);
                 if (it != overrides.end()) {
                     AppId_t targetAppId = (e.DlcAppId != 0) ? e.DlcAppId : (e.AppId != 0 ? e.AppId : AppId);
-                    if (!lockOwned && Hooks_Package::HasValidLicense(targetAppId)) {
-                        LOG_MANIFEST_INFO("BuildDepotDependency: skipping manifest lock for licensed targetAppId={} depot={}",
-                            targetAppId, e.DepotId);
+                    if (!lockOwned && Hooks_Package::HasValidLicense(targetAppId) && e.ManifestGid != 0) {
+                        LOG_MANIFEST_INFO("BuildDepotDependency: preserving official manifest for licensed/shared AppId={} Depot={} OfficialGid={}",
+                            targetAppId, e.DepotId, e.ManifestGid);
                         continue;
                     }
 
