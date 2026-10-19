@@ -43,8 +43,42 @@ struct ScopedHandle {
     [[nodiscard]] HANDLE Get() const noexcept { return h; }
 };
 
-constexpr int kWindowWidth  = 580;
-constexpr int kWindowHeight = 620;
+constexpr int kBaseWindowWidth  = 580;
+constexpr int kBaseWindowHeight = 620;
+
+// High-DPI helper: queries DPI for a specific window or system fallback (Win10 1607+ with Win7/8 fallback)
+[[nodiscard]] UINT GetWindowDpi(HWND hWnd) noexcept {
+    HMODULE hUser32 = ::GetModuleHandleW(L"user32.dll");
+    if (hUser32) {
+        if (hWnd) {
+            using GetDpiForWindow_t = UINT(WINAPI*)(HWND);
+            auto pfn = reinterpret_cast<GetDpiForWindow_t>(::GetProcAddress(hUser32, "GetDpiForWindow"));
+            if (pfn) {
+                const UINT dpi = pfn(hWnd);
+                if (dpi != 0) return dpi;
+            }
+        } else {
+            using GetDpiForSystem_t = UINT(WINAPI*)();
+            auto pfn = reinterpret_cast<GetDpiForSystem_t>(::GetProcAddress(hUser32, "GetDpiForSystem"));
+            if (pfn) {
+                const UINT dpi = pfn();
+                if (dpi != 0) return dpi;
+            }
+        }
+    }
+    HDC hdc = ::GetDC(hWnd);
+    UINT dpi = 96;
+    if (hdc) {
+        dpi = static_cast<UINT>(::GetDeviceCaps(hdc, LOGPIXELSY));
+        ::ReleaseDC(hWnd, hdc);
+    }
+    return (dpi != 0) ? dpi : 96;
+}
+
+// Scales a 96-DPI base pixel value using 64-bit MulDiv rounding
+[[nodiscard]] int Scale(int val, UINT dpi) noexcept {
+    return ::MulDiv(val, static_cast<int>(dpi), 96);
+}
 
 // Control IDs
 enum ControlId : int {
@@ -568,31 +602,144 @@ void OnRemoveDll() {
     }
 }
 
+// Updates UI fonts according to target DPI and applies them to all controls
+void UpdateFontsAndApply(UINT dpi) noexcept {
+    NONCLIENTMETRICSW ncm{ sizeof(ncm) };
+    bool gotMetrics = false;
+
+    HMODULE hUser32 = ::GetModuleHandleW(L"user32.dll");
+    if (hUser32) {
+        using SystemParametersInfoForDpi_t = BOOL(WINAPI*)(UINT, UINT, PVOID, UINT, UINT);
+        auto pfn = reinterpret_cast<SystemParametersInfoForDpi_t>(::GetProcAddress(hUser32, "SystemParametersInfoForDpi"));
+        if (pfn && pfn(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0, dpi)) {
+            gotMetrics = true;
+        }
+    }
+    if (!gotMetrics) {
+        ::SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
+    }
+
+    HFONT hOldUi   = g_hFontUi;
+    HFONT hOldBold = g_hFontBold;
+
+    g_hFontUi = ::CreateFontIndirectW(&ncm.lfMessageFont);
+    LOGFONTW lfBold = ncm.lfMessageFont;
+    lfBold.lfWeight = FW_BOLD;
+    g_hFontBold = ::CreateFontIndirectW(&lfBold);
+
+    const HWND kControls[] = {
+        g_hVersionText, g_hLangLabel, g_hLangCombo, g_hGroupStatus, g_hGroupDllStatus,
+        g_hGroupProbe, g_hGroupPaths, g_hSteamLabel, g_hSteamEdit, g_hPayloadLabel,
+        g_hPayloadEdit, g_hGroupActions, g_hBtnInstallPortable, g_hBtnInstallRoot,
+        g_hBtnUninstall, g_hBtnHotInject, g_hBtnToggleWatcher, g_hBtnDeployDll,
+        g_hBtnRemoveDll, g_hBtnRefresh, g_hBtnOpenLogs, g_hTipText
+    };
+    for (HWND hCtrl : kControls) {
+        if (hCtrl) ::SendMessageW(hCtrl, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontUi), TRUE);
+    }
+    if (g_hStatusText)    ::SendMessageW(g_hStatusText, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
+    if (g_hDllStatusText) ::SendMessageW(g_hDllStatusText, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
+    if (g_hProbeText)     ::SendMessageW(g_hProbeText, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
+
+    // Safely release previous fonts after all controls have transitioned to new fonts
+    if (hOldUi)   ::DeleteObject(hOldUi);
+    if (hOldBold) ::DeleteObject(hOldBold);
+}
+
+// Atomically repositions and resizes all child controls for the specified DPI
+void RelayoutControls(UINT dpi) noexcept {
+    // Dismiss any open dropdown to prevent orphan popup artifact during DPI change
+    if (g_hLangCombo) {
+        ::SendMessageW(g_hLangCombo, CB_SHOWDROPDOWN, FALSE, 0);
+    }
+
+    struct ControlItem {
+        HWND hwnd;
+        int  baseX;
+        int  baseY;
+        int  baseW;
+        int  baseH;
+    };
+
+    const ControlItem items[] = {
+        { g_hVersionText,        20,  14, 180,  20 },
+        { g_hLangLabel,         220,  16, 190,  22 },
+        { g_hLangCombo,         420,  12, 120, 120 },
+        { g_hGroupStatus,        20,  42, 252,  55 },
+        { g_hStatusText,         32,  65, 232,  22 },
+        { g_hGroupDllStatus,    280,  42, 260,  55 },
+        { g_hDllStatusText,     292,  65, 240,  22 },
+        { g_hGroupProbe,         20, 102, 520,  55 },
+        { g_hProbeText,          35, 125, 490,  22 },
+        { g_hGroupPaths,         20, 162, 520, 115 },
+        { g_hSteamLabel,         35, 187, 100,  20 },
+        { g_hSteamEdit,         140, 185, 380,  22 },
+        { g_hPayloadLabel,       35, 222, 100,  20 },
+        { g_hPayloadEdit,       140, 220, 380,  22 },
+        { g_hGroupActions,       20, 287, 520, 220 },
+        { g_hBtnInstallPortable, 35, 310, 310,  32 },
+        { g_hBtnDeployDll,      365, 310, 160,  41 },
+        { g_hBtnInstallRoot,     35, 348, 310,  32 },
+        { g_hBtnRemoveDll,      365, 358, 160,  41 },
+        { g_hBtnUninstall,       35, 386, 310,  32 },
+        { g_hBtnHotInject,       35, 426, 310,  32 },
+        { g_hBtnRefresh,        365, 407, 160,  41 },
+        { g_hBtnToggleWatcher,   35, 464, 310,  32 },
+        { g_hBtnOpenLogs,       365, 455, 160,  41 },
+        { g_hTipText,            20, 520, 520,  35 }
+    };
+
+    HDWP hdwp = ::BeginDeferWindowPos(static_cast<int>(std::size(items)));
+    for (const auto& item : items) {
+        if (!item.hwnd) continue;
+        const int x = Scale(item.baseX, dpi);
+        const int y = Scale(item.baseY, dpi);
+        const int w = Scale(item.baseW, dpi);
+        const int h = Scale(item.baseH, dpi);
+        constexpr UINT uFlags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS;
+        if (hdwp) {
+            hdwp = ::DeferWindowPos(hdwp, item.hwnd, nullptr, x, y, w, h, uFlags);
+        } else {
+            ::SetWindowPos(item.hwnd, nullptr, x, y, w, h, uFlags);
+        }
+    }
+    if (hdwp) {
+        ::EndDeferWindowPos(hdwp);
+    }
+}
+
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
         case WM_CREATE: {
             g_hWnd = hWnd;
-            // Apply font
-            NONCLIENTMETRICSW ncm{ sizeof(ncm) };
-            ::SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
-            g_hFontUi = ::CreateFontIndirectW(&ncm.lfMessageFont);
 
-            LOGFONTW lfBold = ncm.lfMessageFont;
-            lfBold.lfWeight = FW_BOLD;
-            g_hFontBold = ::CreateFontIndirectW(&lfBold);
+            const UINT dpi = GetWindowDpi(hWnd);
+
+            // Cold-start geometry guard: ensure window dimensions match the target monitor DPI
+            const int targetW = Scale(kBaseWindowWidth, dpi);
+            const int targetH = Scale(kBaseWindowHeight, dpi);
+            RECT rcWnd{};
+            ::GetWindowRect(hWnd, &rcWnd);
+            if ((rcWnd.right - rcWnd.left) != targetW || (rcWnd.bottom - rcWnd.top) != targetH) {
+                ::SetWindowPos(hWnd, nullptr, 0, 0, targetW, targetH,
+                               SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+            }
 
             // 0. Version label (Upper left)
             g_hVersionText = CreateWindowW(L"STATIC", L"" OPENSTEAMTOOL_VERSION,
                                            WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                           20, 14, 180, 20, hWnd, reinterpret_cast<HMENU>(IdVersionText), nullptr, nullptr);
+                                           Scale(20, dpi), Scale(14, dpi), Scale(180, dpi), Scale(20, dpi),
+                                           hWnd, reinterpret_cast<HMENU>(IdVersionText), nullptr, nullptr);
 
             // 1. Language switcher (Upper right)
             g_hLangLabel = CreateWindowW(L"STATIC", L"Language / 语言 / Idioma:",
                                          WS_CHILD | WS_VISIBLE | SS_RIGHT,
-                                         220, 16, 190, 22, hWnd, nullptr, nullptr, nullptr);
+                                         Scale(220, dpi), Scale(16, dpi), Scale(190, dpi), Scale(22, dpi),
+                                         hWnd, nullptr, nullptr, nullptr);
             g_hLangCombo = CreateWindowW(L"COMBOBOX", nullptr,
                                          WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
-                                         420, 12, 120, 120, hWnd, reinterpret_cast<HMENU>(IdLangCombo), nullptr, nullptr);
+                                         Scale(420, dpi), Scale(12, dpi), Scale(120, dpi), Scale(120, dpi),
+                                         hWnd, reinterpret_cast<HMENU>(IdLangCombo), nullptr, nullptr);
             ::SendMessageW(g_hLangCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"English"));
             ::SendMessageW(g_hLangCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"简体中文"));
             ::SendMessageW(g_hLangCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Español"));
@@ -601,107 +748,110 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             // 2. Status Group Boxes (Left: IFEO Status, Right: Standard DLL Status)
             g_hGroupStatus = CreateWindowW(L"BUTTON", L"System IFEO Status",
                                            WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                           20, 42, 252, 55, hWnd, reinterpret_cast<HMENU>(IdGroupStatus), nullptr, nullptr);
+                                           Scale(20, dpi), Scale(42, dpi), Scale(252, dpi), Scale(55, dpi),
+                                           hWnd, reinterpret_cast<HMENU>(IdGroupStatus), nullptr, nullptr);
             g_hStatusText = CreateWindowW(L"STATIC", L"...",
                                           WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
-                                          32, 65, 232, 22, hWnd, reinterpret_cast<HMENU>(IdStatusText), nullptr, nullptr);
+                                          Scale(32, dpi), Scale(65, dpi), Scale(232, dpi), Scale(22, dpi),
+                                          hWnd, reinterpret_cast<HMENU>(IdStatusText), nullptr, nullptr);
 
             g_hGroupDllStatus = CreateWindowW(L"BUTTON", L"Standard DLL Status",
                                               WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                              280, 42, 260, 55, hWnd, reinterpret_cast<HMENU>(IdGroupDllStatus), nullptr, nullptr);
+                                              Scale(280, dpi), Scale(42, dpi), Scale(260, dpi), Scale(55, dpi),
+                                              hWnd, reinterpret_cast<HMENU>(IdGroupDllStatus), nullptr, nullptr);
             g_hDllStatusText = CreateWindowW(L"STATIC", L"...",
                                              WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
-                                             292, 65, 240, 22, hWnd, reinterpret_cast<HMENU>(IdDllStatusText), nullptr, nullptr);
+                                             Scale(292, dpi), Scale(65, dpi), Scale(240, dpi), Scale(22, dpi),
+                                             hWnd, reinterpret_cast<HMENU>(IdDllStatusText), nullptr, nullptr);
 
             // 3. Probe Group Box
             g_hGroupProbe = CreateWindowW(L"BUTTON", L"Steam Client Probe",
                                           WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                          20, 102, 520, 55, hWnd, reinterpret_cast<HMENU>(IdGroupProbe), nullptr, nullptr);
+                                          Scale(20, dpi), Scale(102, dpi), Scale(520, dpi), Scale(55, dpi),
+                                          hWnd, reinterpret_cast<HMENU>(IdGroupProbe), nullptr, nullptr);
             g_hProbeText = CreateWindowW(L"STATIC", L"...",
                                          WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                         35, 125, 490, 22, hWnd, reinterpret_cast<HMENU>(IdProbeText), nullptr, nullptr);
+                                         Scale(35, dpi), Scale(125, dpi), Scale(490, dpi), Scale(22, dpi),
+                                         hWnd, reinterpret_cast<HMENU>(IdProbeText), nullptr, nullptr);
 
             // 4. Paths Group Box
             g_hGroupPaths = CreateWindowW(L"BUTTON", L"Target & Paths",
                                           WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                          20, 162, 520, 115, hWnd, reinterpret_cast<HMENU>(IdGroupPaths), nullptr, nullptr);
+                                          Scale(20, dpi), Scale(162, dpi), Scale(520, dpi), Scale(115, dpi),
+                                          hWnd, reinterpret_cast<HMENU>(IdGroupPaths), nullptr, nullptr);
 
             g_hSteamLabel = CreateWindowW(L"STATIC", L"Steam Path:",
                                           WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                          35, 187, 100, 20, hWnd, reinterpret_cast<HMENU>(IdSteamLabel), nullptr, nullptr);
+                                          Scale(35, dpi), Scale(187, dpi), Scale(100, dpi), Scale(20, dpi),
+                                          hWnd, reinterpret_cast<HMENU>(IdSteamLabel), nullptr, nullptr);
             g_hSteamEdit  = CreateWindowW(L"EDIT", L"",
                                           WS_CHILD | WS_VISIBLE | ES_READONLY | ES_AUTOHSCROLL | WS_BORDER,
-                                          140, 185, 380, 22, hWnd, reinterpret_cast<HMENU>(IdSteamEdit), nullptr, nullptr);
+                                          Scale(140, dpi), Scale(185, dpi), Scale(380, dpi), Scale(22, dpi),
+                                          hWnd, reinterpret_cast<HMENU>(IdSteamEdit), nullptr, nullptr);
 
             g_hPayloadLabel = CreateWindowW(L"STATIC", L"OST Payload:",
                                             WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                            35, 222, 100, 20, hWnd, reinterpret_cast<HMENU>(IdPayloadLabel), nullptr, nullptr);
+                                            Scale(35, dpi), Scale(222, dpi), Scale(100, dpi), Scale(20, dpi),
+                                            hWnd, reinterpret_cast<HMENU>(IdPayloadLabel), nullptr, nullptr);
             g_hPayloadEdit  = CreateWindowW(L"EDIT", L"",
                                             WS_CHILD | WS_VISIBLE | ES_READONLY | ES_AUTOHSCROLL | WS_BORDER,
-                                            140, 220, 380, 22, hWnd, reinterpret_cast<HMENU>(IdPayloadEdit), nullptr, nullptr);
+                                            Scale(140, dpi), Scale(220, dpi), Scale(380, dpi), Scale(22, dpi),
+                                            hWnd, reinterpret_cast<HMENU>(IdPayloadEdit), nullptr, nullptr);
 
             // 5. Actions Group Box
             g_hGroupActions = CreateWindowW(L"BUTTON", L"Operations",
                                             WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                                            20, 287, 520, 220, hWnd, reinterpret_cast<HMENU>(IdGroupActions), nullptr, nullptr);
+                                            Scale(20, dpi), Scale(287, dpi), Scale(520, dpi), Scale(220, dpi),
+                                            hWnd, reinterpret_cast<HMENU>(IdGroupActions), nullptr, nullptr);
 
             g_hBtnInstallPortable = CreateWindowW(L"BUTTON", L"Install IFEO (Portable Mode)",
                                                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                                                  35, 310, 310, 32, hWnd, reinterpret_cast<HMENU>(IdBtnInstallPortable), nullptr, nullptr);
+                                                  Scale(35, dpi), Scale(310, dpi), Scale(310, dpi), Scale(32, dpi),
+                                                  hWnd, reinterpret_cast<HMENU>(IdBtnInstallPortable), nullptr, nullptr);
             g_hBtnDeployDll = CreateWindowW(L"BUTTON", L"Deploy Standard DLL",
                                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                                            365, 310, 160, 41, hWnd, reinterpret_cast<HMENU>(IdBtnDeployDll), nullptr, nullptr);
+                                            Scale(365, dpi), Scale(310, dpi), Scale(160, dpi), Scale(41, dpi),
+                                            hWnd, reinterpret_cast<HMENU>(IdBtnDeployDll), nullptr, nullptr);
 
             g_hBtnInstallRoot = CreateWindowW(L"BUTTON", L"Install IFEO (Steam Root Mode)",
                                               WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                                              35, 348, 310, 32, hWnd, reinterpret_cast<HMENU>(IdBtnInstallRoot), nullptr, nullptr);
+                                              Scale(35, dpi), Scale(348, dpi), Scale(310, dpi), Scale(32, dpi),
+                                              hWnd, reinterpret_cast<HMENU>(IdBtnInstallRoot), nullptr, nullptr);
             g_hBtnRemoveDll = CreateWindowW(L"BUTTON", L"Remove DLL",
                                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                                            365, 358, 160, 41, hWnd, reinterpret_cast<HMENU>(IdBtnRemoveDll), nullptr, nullptr);
+                                            Scale(365, dpi), Scale(358, dpi), Scale(160, dpi), Scale(41, dpi),
+                                            hWnd, reinterpret_cast<HMENU>(IdBtnRemoveDll), nullptr, nullptr);
 
             g_hBtnUninstall = CreateWindowW(L"BUTTON", L"Uninstall IFEO",
                                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                                            35, 386, 310, 32, hWnd, reinterpret_cast<HMENU>(IdBtnUninstall), nullptr, nullptr);
+                                            Scale(35, dpi), Scale(386, dpi), Scale(310, dpi), Scale(32, dpi),
+                                            hWnd, reinterpret_cast<HMENU>(IdBtnUninstall), nullptr, nullptr);
 
             g_hBtnHotInject = CreateWindowW(L"BUTTON", L"Launch & Inject Steam",
                                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                                            35, 426, 310, 32, hWnd, reinterpret_cast<HMENU>(IdBtnHotInject), nullptr, nullptr);
+                                            Scale(35, dpi), Scale(426, dpi), Scale(310, dpi), Scale(32, dpi),
+                                            hWnd, reinterpret_cast<HMENU>(IdBtnHotInject), nullptr, nullptr);
             g_hBtnRefresh = CreateWindowW(L"BUTTON", L"Refresh Status",
                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                                          365, 407, 160, 41, hWnd, reinterpret_cast<HMENU>(IdBtnRefresh), nullptr, nullptr);
+                                          Scale(365, dpi), Scale(407, dpi), Scale(160, dpi), Scale(41, dpi),
+                                          hWnd, reinterpret_cast<HMENU>(IdBtnRefresh), nullptr, nullptr);
 
             g_hBtnToggleWatcher = CreateWindowW(L"BUTTON", L"Start Background Watcher",
                                                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                                                35, 464, 310, 32, hWnd, reinterpret_cast<HMENU>(IdBtnToggleWatcher), nullptr, nullptr);
+                                                Scale(35, dpi), Scale(464, dpi), Scale(310, dpi), Scale(32, dpi),
+                                                hWnd, reinterpret_cast<HMENU>(IdBtnToggleWatcher), nullptr, nullptr);
             g_hBtnOpenLogs = CreateWindowW(L"BUTTON", L"Open Logs",
                                            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                                           365, 455, 160, 41, hWnd, reinterpret_cast<HMENU>(IdBtnOpenLogs), nullptr, nullptr);
+                                           Scale(365, dpi), Scale(455, dpi), Scale(160, dpi), Scale(41, dpi),
+                                           hWnd, reinterpret_cast<HMENU>(IdBtnOpenLogs), nullptr, nullptr);
 
             g_hTipText = CreateWindowW(L"STATIC", L"",
                                        WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                       20, 520, 520, 35, hWnd, reinterpret_cast<HMENU>(IdTipText), nullptr, nullptr);
+                                       Scale(20, dpi), Scale(520, dpi), Scale(520, dpi), Scale(35, dpi),
+                                       hWnd, reinterpret_cast<HMENU>(IdTipText), nullptr, nullptr);
 
-            // Set font to all controls
-            const HWND kControls[] = {
-                g_hVersionText, g_hLangLabel, g_hLangCombo, g_hGroupStatus, g_hGroupDllStatus, g_hGroupProbe, g_hGroupPaths, g_hSteamLabel,
-                g_hSteamEdit, g_hPayloadLabel, g_hPayloadEdit, g_hGroupActions,
-                g_hBtnInstallPortable, g_hBtnInstallRoot, g_hBtnUninstall,
-                g_hBtnHotInject, g_hBtnToggleWatcher,
-                g_hBtnDeployDll, g_hBtnRemoveDll,
-                g_hBtnRefresh, g_hBtnOpenLogs, g_hTipText
-            };
-            for (HWND hCtrl : kControls) {
-                if (hCtrl) ::SendMessageW(hCtrl, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontUi), TRUE);
-            }
-            if (g_hStatusText) {
-                ::SendMessageW(g_hStatusText, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
-            }
-            if (g_hDllStatusText) {
-                ::SendMessageW(g_hDllStatusText, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
-            }
-            if (g_hProbeText) {
-                ::SendMessageW(g_hProbeText, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
-            }
+            // Apply scaled fonts to all controls
+            UpdateFontsAndApply(dpi);
 
             // Show UAC shield on actions if running as standard user
             #ifndef BCM_SETSHIELD
@@ -721,6 +871,28 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
             // Heartbeat timer to keep button state and process probes dynamically in sync
             ::SetTimer(hWnd, IdTimerStatus, 1000, nullptr);
+            return 0;
+        }
+
+        case WM_DPICHANGED: {
+            const UINT newDpi = HIWORD(wParam);
+            const RECT* prcNewWindow = reinterpret_cast<RECT*>(lParam);
+            if (prcNewWindow) {
+                ::SetWindowPos(hWnd, nullptr,
+                               prcNewWindow->left, prcNewWindow->top,
+                               prcNewWindow->right - prcNewWindow->left,
+                               prcNewWindow->bottom - prcNewWindow->top,
+                               SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+            } else {
+                const int w = Scale(kBaseWindowWidth, newDpi);
+                const int h = Scale(kBaseWindowHeight, newDpi);
+                ::SetWindowPos(hWnd, nullptr, 0, 0, w, h,
+                               SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+            }
+            UpdateFontsAndApply(newDpi);
+            RelayoutControls(newDpi);
+            ::InvalidateRect(hWnd, nullptr, TRUE);
+            ::UpdateWindow(hWnd);
             return 0;
         }
 
@@ -966,7 +1138,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         return 0;
     }
 
-    ::SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    HMODULE hUser32 = ::GetModuleHandleW(L"user32.dll");
+    if (hUser32) {
+        using SetProcessDpiAwarenessContext_t = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
+        auto pfn = reinterpret_cast<SetProcessDpiAwarenessContext_t>(::GetProcAddress(hUser32, "SetProcessDpiAwarenessContext"));
+        if (pfn) {
+            pfn(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+    }
 
     INITCOMMONCONTROLSEX icex{ sizeof(icex) };
     icex.dwICC = ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES;
@@ -992,16 +1171,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         return 1;
     }
 
-    const int screenW = ::GetSystemMetrics(SM_CXSCREEN);
-    const int screenH = ::GetSystemMetrics(SM_CYSCREEN);
-    const int posX = (screenW - kWindowWidth) / 2;
-    const int posY = (screenH - kWindowHeight) / 2;
+    const UINT initialDpi = GetWindowDpi(nullptr);
+    const int winW = Scale(kBaseWindowWidth, initialDpi);
+    const int winH = Scale(kBaseWindowHeight, initialDpi);
+
+    RECT workArea{};
+    if (!::SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0)) {
+        workArea = RECT{ 0, 0, ::GetSystemMetrics(SM_CXSCREEN), ::GetSystemMetrics(SM_CYSCREEN) };
+    }
+    const int posX = workArea.left + ((workArea.right - workArea.left) - winW) / 2;
+    const int posY = workArea.top + ((workArea.bottom - workArea.top) - winH) / 2;
 
     const std::wstring initialTitle = std::format(L"{} [{}]", I18n::Get(StringId::AppTitle), L"" OPENSTEAMTOOL_VERSION);
     g_hWnd = ::CreateWindowExW(
         0, kClassName, initialTitle.c_str(),
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        posX, posY, kWindowWidth, kWindowHeight,
+        posX, posY, winW, winH,
         nullptr, nullptr, hInstance, nullptr
     );
 

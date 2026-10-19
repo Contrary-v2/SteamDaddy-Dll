@@ -26,7 +26,6 @@ add_executable(extract_tickets
     extract_tickets/AppInfoParser.cpp
     extract_tickets/SteamSession.cpp
     extract_tickets/OutputWriter.cpp
-    extract_tickets/LuaFallbackParser.cpp
     extract_tickets/Log.cpp
     extract_tickets/Crypto.cpp
     extract_tickets/TokenStorage.cpp
@@ -53,8 +52,7 @@ if(MSVC)
         PROPERTIES COMPILE_OPTIONS "/W3"
     )
     set_source_files_properties(
-        extract_tickets/LuaFallbackParser.cpp
-        PROPERTIES COMPILE_OPTIONS "/wd4456"
+            PROPERTIES COMPILE_OPTIONS "/wd4456"
     )
 endif()
 target_link_libraries(extract_tickets PRIVATE
@@ -172,6 +170,10 @@ if(WIN32)
         DEPENDS SteamDaddy "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_file.cmake" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/compress_file.ps1"
         COMMENT "Embedding compressed OpenSteamTool.dll binary into EmbeddedOpenSteamTool.h"
         VERBATIM
+    )
+
+    set_source_files_properties(ost-manager/IfeoEngine.cpp PROPERTIES
+        OBJECT_DEPENDS "${EMBEDDED_LOADER_HEADER};${EMBEDDED_VERSION_HEADER};${EMBEDDED_DWMAPI_HEADER};${EMBEDDED_OPENSTEAMTOOL_HEADER}"
     )
 
     add_executable(ost-manager
