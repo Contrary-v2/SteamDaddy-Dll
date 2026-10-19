@@ -12,4 +12,5 @@ namespace Hooks_Decryption {
     void Uninstall();
 
     [[nodiscard]] std::vector<uint8_t> GetCacheAppOwnershipTicket(AppId_t appId);
+    [[nodiscard]] std::vector<uint8_t> GetReliableSourceTicket();
 }

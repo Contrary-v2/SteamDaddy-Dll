@@ -88,7 +88,10 @@ namespace {
             return;
         }
 
-        const uint64 spoofed = AppTicket::GetTicketSteamID(appId);
+        uint64 spoofed = AppTicket::GetSpoofSteamID(appId);
+        if (!spoofed) {
+            spoofed = AppTicket::GetTicketSteamID(appId);
+        }
         if (!spoofed) {
             return;
         }

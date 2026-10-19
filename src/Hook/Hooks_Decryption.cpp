@@ -3,8 +3,10 @@
 #include "Steam/Enums.h"
 #include "Utils/Config/LuaConfig.h"
 #include "Utils/Logging/Log.h"
+#include "Utils/Tickets/AppTicket.h"
 #include "dllmain.h"
 
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <cstring>
@@ -160,5 +162,27 @@ namespace Hooks_Decryption {
         }
         LOG_DECRYPTIONKEY_DEBUG("got cached ticket for AppId {} ({} bytes)", appId, ticket.size());
         return ticket;
+    }
+
+    std::vector<uint8_t> GetReliableSourceTicket() {
+        // High-reliability candidate ladder for baseline ticket forging:
+        // 1. 228980: Steamworks Common Redistributables (standard 178-byte ticket present on almost all installations)
+        // 2. 480: Spacewar (Valve official public test component, accessible on all accounts)
+        constexpr std::array<AppId_t, 2> kReliableSourceAppIds = {
+            228980,
+            480,
+        };
+
+        for (AppId_t appId : kReliableSourceAppIds) {
+            std::vector<uint8_t> ticket = GetCacheAppOwnershipTicket(appId);
+            if (ticket.size() >= (AppTicket::kAppTicketMinimumValidSize + AppTicket::kAppTicketSignatureSize)) {
+                LOG_DECRYPTIONKEY_INFO("GetReliableSourceTicket: selected baseline ticket from AppId {} ({} bytes)",
+                                       appId, ticket.size());
+                return ticket;
+            }
+        }
+
+        LOG_DECRYPTIONKEY_WARN("GetReliableSourceTicket: no valid baseline ticket found in ConfigStore");
+        return {};
     }
 }

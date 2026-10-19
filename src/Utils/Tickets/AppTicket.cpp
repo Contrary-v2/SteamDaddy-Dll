@@ -97,6 +97,7 @@ namespace AppTicket {
         };
 
         std::atomic<SourceTicketProvider> g_sourceTicketProvider{nullptr};
+        std::atomic<BaselineTicketProvider> g_baselineTicketProvider{nullptr};
         std::shared_mutex g_ticketMutex;
         std::unordered_map<AppId_t, AppTicketEntry> g_tickets;
     } // namespace
@@ -105,10 +106,21 @@ namespace AppTicket {
         g_sourceTicketProvider.store(provider, std::memory_order_release);
     }
 
+    void SetBaselineTicketProvider(BaselineTicketProvider provider) noexcept {
+        g_baselineTicketProvider.store(provider, std::memory_order_release);
+    }
+
     std::vector<uint8_t> GetSteamConfigStoreTicket(AppId_t appId) {
         if (appId == 0) return {};
         if (auto provider = g_sourceTicketProvider.load(std::memory_order_acquire)) {
             return provider(appId);
+        }
+        return {};
+    }
+
+    std::vector<uint8_t> GetReliableBaselineTicket() {
+        if (auto provider = g_baselineTicketProvider.load(std::memory_order_acquire)) {
+            return provider();
         }
         return {};
     }
@@ -130,6 +142,30 @@ namespace AppTicket {
         }
         LOG_TRACE("Read App Ownership Ticket for AppId {}: ticket unavailable", appId);
         return {};
+    }
+
+    // Pure functional forging of an ownership ticket from a trusted baseline source ticket
+    std::vector<uint8_t> ForgeTicketFromSource(AppId_t targetAppId, std::span<const uint8_t> source) noexcept {
+        if (targetAppId == 0 || source.size() <= kAppTicketSignatureSize) {
+            return {};
+        }
+
+        const size_t signedSize = source.size() - kAppTicketSignatureSize;
+        if (signedSize < kAppTicketMinimumValidSize) {
+            return {};
+        }
+
+        std::vector<uint8_t> ticket;
+        ticket.resize(source.size() + sizeof(AppId_t));
+
+        auto* dst = ticket.data();
+        std::memcpy(dst, source.data(), signedSize);
+        std::memcpy(dst + signedSize, &targetAppId, sizeof(AppId_t));
+        std::memcpy(dst + signedSize + sizeof(AppId_t), source.data() + signedSize, kAppTicketSignatureSize);
+
+        LOG_INFO("Forged App Ownership Ticket, AppId: {}, Physical Size: {}, Total Size: {}",
+                 targetAppId, ticket.size(), source.size());
+        return ticket;
     }
 
     // Exploit steamdrmp's off-by-four ticket parsing vulnerability:
@@ -181,7 +217,14 @@ namespace AppTicket {
 
         if (source == AppTicketSource::MemoryOnly) return false;
 
-        ticket.data = ForgeLocalAppOwnershipTicket(appId);
+        // Try baseline ladder first
+        const std::vector<uint8_t> baseline = GetReliableBaselineTicket();
+        if (!baseline.empty()) {
+            ticket.data = ForgeTicketFromSource(appId, baseline);
+        }
+        if (ticket.data.empty()) {
+            ticket.data = ForgeLocalAppOwnershipTicket(appId);
+        }
         if (ticket.data.empty()) return false;
 
         ticket.totalSize = static_cast<uint32>(ticket.data.size() - sizeof(AppId_t));
@@ -286,7 +329,14 @@ namespace AppTicket {
 
     uint64_t GetForgeSteamID(AppId_t appId) {
         if (!LuaConfig::HasDepot(appId)) return 0;
-        auto ticket = ForgeLocalAppOwnershipTicket(appId);
+        const auto baseline = GetReliableBaselineTicket();
+        std::vector<uint8_t> ticket;
+        if (!baseline.empty()) {
+            ticket = ForgeTicketFromSource(appId, baseline);
+        }
+        if (ticket.empty()) {
+            ticket = ForgeLocalAppOwnershipTicket(appId);
+        }
         return ExtractSteamIdFromTicketBytes(ticket);
     }
 
