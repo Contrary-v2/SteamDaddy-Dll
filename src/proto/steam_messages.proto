@@ -562,3 +562,26 @@ message CMsgClientSharedLibraryLockStatus {
     repeated .CMsgClientSharedLibraryLockStatus.LockedLibrary locked_libraries = 1;
     optional uint32 own_library_locked_by = 2;
 }
+
+// ============================================================
+// Player.ClientGetLastPlayedTimes (eMsg 151 / 147)
+// ============================================================
+
+message CPlayer_GetLastPlayedTimes_Request {
+    optional uint32 min_last_played = 1;
+}
+
+message CPlayer_GetLastPlayedTimes_Response {
+    message Game {
+        optional int32 appid = 1;
+        optional uint32 last_playtime = 2;
+        optional int32 playtime_2weeks = 3;
+        optional int32 playtime_forever = 4;
+        optional uint32 first_playtime = 5;
+        optional int32 playtime_windows_forever = 6;
+        optional int32 playtime_mac_forever = 7;
+        optional int32 playtime_linux_forever = 8;
+        optional int32 playtime_deck_forever = 9;
+    }
+    repeated .CPlayer_GetLastPlayedTimes_Response.Game games = 1;
+}

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <span>
+#include <vector>
 
 // Hosts CloudRedirect's prebuilt cloud_redirect.dll inside the Steam process and
 // drives its third-party client API (see CloudRedirect/src/common/cr_api.h):
@@ -55,6 +56,16 @@ namespace CloudRedirectHost {
     void NotifyAppRunning(uint32_t appId, bool running);
     void NotifyStatsStored(uint32_t appId);
 
+    
+    struct PlaytimeInfo {
+        uint32_t minutesForever;
+        uint32_t minutesLastTwoWeeks;
+        uint32_t lastPlayedTime;
+        uint32_t playtimeWindows;
+        uint32_t playtimeMac;
+        uint32_t playtimeLinux;
+    };
+
     struct AchievementBlock {
         uint32_t statId;
         uint32_t bits;
@@ -62,6 +73,9 @@ namespace CloudRedirectHost {
     };
     // Returns number of blocks written (0 if none/disabled).
     [[nodiscard]] uint32_t GetAchievements(uint32_t appId, std::span<AchievementBlock> outBlocks);
+    [[nodiscard]] bool GetPlaytime(uint32_t appId, PlaytimeInfo* out);
+    [[nodiscard]] std::vector<uint32_t> GetRedirectedAppIds();
+
     [[nodiscard]] uint32_t GetAchievements(uint32_t appId, AchievementBlock* out, uint32_t maxBlocks);
 
     // Teardown. Called from DLL_PROCESS_DETACH.

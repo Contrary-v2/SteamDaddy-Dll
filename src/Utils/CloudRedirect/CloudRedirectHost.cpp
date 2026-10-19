@@ -3,6 +3,7 @@
 
 #include "OSTPlatform/include/DynamicLibrary.h"
 #include "OSTPlatform/include/Encoding.h"
+#include "OSTPlatform/include/Thread.h"
 #include "Utils/Config/Config.h"
 #include "Utils/Config/LuaConfig.h"
 #include "Utils/Logging/Log.h"
@@ -35,6 +36,7 @@ namespace {
     using CR_NotifyAppRunning_t  = void (*)(uint32_t, bool);
     using CR_NotifyStatsStored_t = void (*)(uint32_t);
     using CR_GetAchievements_t    = uint32_t (*)(uint32_t, CloudRedirectHost::AchievementBlock*, uint32_t);
+    using CR_GetPlaytime_t        = bool (*)(uint32_t, CloudRedirectHost::PlaytimeInfo*);
     using CR_InstallVtableHooks_t = bool (*)();
 
     std::mutex            g_mutex;
@@ -42,6 +44,10 @@ namespace {
     std::atomic<uint32_t> g_cachedAccountId{0};
     std::atomic<uint32_t> g_inFlightCalls{0};
     OSTPlatform::DynamicLibrary::ModuleHandle g_module = nullptr;
+
+    std::mutex                   g_syncMutex;
+    std::unordered_set<uint32_t> g_inFlightSyncs;
+    std::unordered_set<uint32_t> g_pendingResyncs;
 
     struct InFlightGuard {
         bool active = false;
@@ -74,6 +80,7 @@ namespace {
     CR_NotifyAppRunning_t   g_notifyAppRunning   = nullptr;
     CR_NotifyStatsStored_t  g_notifyStatsStored  = nullptr;
     CR_GetAchievements_t    g_getAchievements    = nullptr;
+    CR_GetPlaytime_t        g_getPlaytime        = nullptr;
     CR_InstallVtableHooks_t g_installVtableHooks = nullptr;
 
     std::atomic<OnlineFixAppResolver> g_onlineFixResolver{nullptr};
@@ -197,6 +204,7 @@ void Initialize(const char* steamInstallPath) {
     ResolveSymbol(g_module, "CR_NotifyAppRunning",   g_notifyAppRunning);
     ResolveSymbol(g_module, "CR_NotifyStatsStored",  g_notifyStatsStored);
     ResolveSymbol(g_module, "CR_GetAchievements",    g_getAchievements);
+    ResolveSymbol(g_module, "CR_GetPlaytime",        g_getPlaytime);
     ResolveSymbol(g_module, "CR_InstallVtableHooks", g_installVtableHooks);
 
     try {
@@ -302,10 +310,12 @@ bool IsActive() noexcept {
 }
 
 bool IsApp(uint32_t appId) {
-    if (IsAppLicensed(appId)) return false;
+    if (appId == 0) return false;
     if (!g_active.load(std::memory_order_acquire)) return false;
+
+    bool isCrApp = false;
     try {
-        if (g_isApp && g_isApp(appId)) return true;
+        if (g_isApp && g_isApp(appId)) isCrApp = true;
     } catch (const std::exception& e) {
         LOG_ERROR("CloudRedirect: CR_IsApp({}) failed: {}", appId, e.what());
         return false;
@@ -313,10 +323,14 @@ bool IsApp(uint32_t appId) {
         LOG_ERROR("CloudRedirect: CR_IsApp({}) failed with unknown exception", appId);
         return false;
     }
-    const auto resolver = g_onlineFixResolver.load(std::memory_order_relaxed);
-    const uint32_t fixAppId = resolver ? resolver() : 0;
-    if (fixAppId != 0 && appId == fixAppId) return true;
-    return false;
+    if (!isCrApp) {
+        const auto resolver = g_onlineFixResolver.load(std::memory_order_relaxed);
+        const uint32_t fixAppId = resolver ? resolver() : 0;
+        if (fixAppId != 0 && appId == fixAppId) isCrApp = true;
+    }
+    if (!isCrApp) return false;
+
+    return !IsAppLicensed(appId);
 }
 
 void AddApp(uint32_t appId) {
@@ -404,14 +418,60 @@ void NotifyAppRunning(uint32_t appId, bool running) {
 }
 
 void NotifyStatsStored(uint32_t appId) {
-    if (IsAppLicensed(appId)) return;
+    if (appId == 0) return;
     if (!g_active.load(std::memory_order_acquire) || !g_notifyStatsStored) return;
-    try {
-        g_notifyStatsStored(appId);
-    } catch (const std::exception& e) {
-        LOG_ERROR("CloudRedirect: CR_NotifyStatsStored({}) failed: {}", appId, e.what());
-    } catch (...) {
-        LOG_ERROR("CloudRedirect: CR_NotifyStatsStored({}) failed with unknown exception", appId);
+    if (IsAppLicensed(appId)) return;
+
+    bool shouldSpawn = false;
+    {
+        std::lock_guard<std::mutex> lock(g_syncMutex);
+        if (g_inFlightSyncs.contains(appId)) {
+            g_pendingResyncs.insert(appId);
+            return;
+        }
+        g_inFlightSyncs.insert(appId);
+        shouldSpawn = true;
+    }
+
+    if (shouldSpawn) {
+        const bool started = OSTPlatform::Thread::StartDetached([appId]() -> uint32_t {
+            while (true) {
+                if (!g_active.load(std::memory_order_acquire)) {
+                    std::lock_guard<std::mutex> lock(g_syncMutex);
+                    g_inFlightSyncs.erase(appId);
+                    g_pendingResyncs.erase(appId);
+                    return 0;
+                }
+
+                {
+                    InFlightGuard guard;
+                    if (guard && g_notifyStatsStored) {
+                        try {
+                            g_notifyStatsStored(appId);
+                        } catch (const std::exception& e) {
+                            LOG_ERROR("CloudRedirect: CR_NotifyStatsStored({}) failed: {}", appId, e.what());
+                        } catch (...) {
+                            LOG_ERROR("CloudRedirect: CR_NotifyStatsStored({}) failed with unknown exception", appId);
+                        }
+                    }
+                }
+
+                std::lock_guard<std::mutex> lock(g_syncMutex);
+                if (g_pendingResyncs.erase(appId) > 0 && g_active.load(std::memory_order_acquire)) {
+                    continue;
+                }
+                g_inFlightSyncs.erase(appId);
+                break;
+            }
+            return 0;
+        });
+
+        if (!started) {
+            std::lock_guard<std::mutex> lock(g_syncMutex);
+            g_inFlightSyncs.erase(appId);
+            g_pendingResyncs.erase(appId);
+            LOG_ERROR("CloudRedirect: failed to spawn worker for NotifyStatsStored({})", appId);
+        }
     }
 }
 
@@ -438,6 +498,29 @@ uint32_t GetAchievements(uint32_t appId, std::span<AchievementBlock> outBlocks) 
     return GetAchievements(appId, outBlocks.data(), static_cast<uint32_t>(outBlocks.size()));
 }
 
+
+bool GetPlaytime(uint32_t appId, PlaytimeInfo* out) {
+    if (appId == 0 || !out) return false;
+    if (IsAppLicensed(appId)) return false;
+
+    InFlightGuard guard;
+    if (!guard || !g_getPlaytime) return false;
+
+    try {
+        return g_getPlaytime(appId, out);
+    } catch (const std::exception& e) {
+        LOG_ERROR("CloudRedirect: CR_GetPlaytime({}) failed: {}", appId, e.what());
+        return false;
+    } catch (...) {
+        LOG_ERROR("CloudRedirect: CR_GetPlaytime({}) failed with unknown exception", appId);
+        return false;
+    }
+}
+
+std::vector<uint32_t> GetRedirectedAppIds() {
+    return CollectRedirectedAppIds();
+}
+
 void Shutdown() {
     std::lock_guard lock(g_mutex);
     if (!g_active.exchange(false, std::memory_order_acq_rel)) return;
@@ -445,6 +528,12 @@ void Shutdown() {
     // Bounded wait (up to 50ms) for in-flight calls to exit, preventing Loader Lock deadlock.
     for (int i = 0; i < 50 && g_inFlightCalls.load(std::memory_order_acquire) > 0; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    {
+        std::lock_guard<std::mutex> syncLock(g_syncMutex);
+        g_inFlightSyncs.clear();
+        g_pendingResyncs.clear();
     }
 
     g_cachedAccountId.store(0, std::memory_order_release);
@@ -474,6 +563,7 @@ void Shutdown() {
     g_notifyAppRunning   = nullptr;
     g_notifyStatsStored  = nullptr;
     g_getAchievements    = nullptr;
+    g_getPlaytime        = nullptr;
     g_installVtableHooks = nullptr;
     LOG_INFO("CloudRedirect: shut down");
 }

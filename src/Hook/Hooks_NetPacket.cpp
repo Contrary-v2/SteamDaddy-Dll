@@ -419,6 +419,7 @@ namespace {
     // ── Hash constants for target_job_name dispatch ─────────────────
     constexpr uint32 HASH_JOB_NotifyRunningApps      = Fnv1aHash("FamilyGroupsClient.NotifyRunningApps#1");
     constexpr uint32 HASH_JOB_GetUserStats           = Fnv1aHash("Player.GetUserStats#1");
+    constexpr uint32 HASH_JOB_ClientGetLastPlayedTimes = Fnv1aHash("Player.ClientGetLastPlayedTimes#1");
     constexpr uint32 HASH_JOB_GetManifestRequestCode = Fnv1aHash("ContentServerDirectory.GetManifestRequestCode#1");
 
 } // anonymous namespace
@@ -805,55 +806,136 @@ namespace Hooks_NetPacket_UserStats {
     void HandleRecv_ClientStoreUserStatsResponse(CNetPacket* pPacket,
                                                  const UnpackedPacket& pkt)
     {
-        if (pkt.body.empty()) return;
+        try {
+            if (pkt.body.empty()) return;
 
-        CMsgClientStoreUserStatsResponse resp;
-        if (!resp.ParseFromArray(pkt.body.data(), static_cast<int>(pkt.body.size())))
-            return;
-        LOG_ACHIEVEMENT_DEBUG("ClientStoreUserStats response: original body:\n{}", resp.DebugString());
-        if (!resp.has_game_id())
-            return;
+            CMsgClientStoreUserStatsResponse resp;
+            if (!resp.ParseFromArray(pkt.body.data(), static_cast<int>(pkt.body.size())))
+                return;
+            LOG_ACHIEVEMENT_DEBUG("ClientStoreUserStats response: original body:\n{}", resp.DebugString());
 
-        const AppId_t appId = ResolveOnlineFixAppId(ExtractSteamAppId(resp.game_id()));
-        if (Hooks_Package::HasValidLicense(appId)) {
-            return;
-        }
-        if (!LuaConfig::HasDepot(appId) && !CloudRedirectHost::IsApp(appId)) {
-            return;
-        }
+            if (!resp.has_game_id())
+                return;
 
-        CMsgProtoBufHeader hdrMsg;
-        bool hdrChanged = false;
-        if (!pkt.hdr.empty() &&
-            hdrMsg.ParseFromArray(pkt.hdr.data(), static_cast<int>(pkt.hdr.size())) &&
-            hdrMsg.has_eresult() && hdrMsg.eresult() != k_EResultOK)
-        {
-            hdrMsg.set_eresult(k_EResultOK);
-            if (hdrMsg.has_error_message()) {
-                hdrMsg.clear_error_message();
+            const AppId_t appId = ResolveOnlineFixAppId(ExtractSteamAppId(resp.game_id()));
+
+            if (!LuaConfig::HasDepot(appId) && !CloudRedirectHost::IsApp(appId)) {
+                return;
             }
-            hdrChanged = true;
-            LOG_ACHIEVEMENT_DEBUG("ClientStoreUserStats response: patched header eresult to OK for app {}", appId);
-        }
-
-        bool bodyChanged = false;
-        if (resp.eresult() != k_EResultOK) {
-            resp.set_eresult(k_EResultOK);
-            bodyChanged = true;
-        }
-        if (resp.has_stats_failed_validation()) {
-            resp.clear_stats_failed_validation();
-            bodyChanged = true;
-        }
-
-        if (hdrChanged || bodyChanged) {
-            if (CommitRecvPacket(pPacket, pkt, hdrChanged ? &hdrMsg : nullptr, bodyChanged ? &resp : nullptr)) {
-                LOG_ACHIEVEMENT_DEBUG("ClientStoreUserStats response: committed patched response for app {}", appId);
+            if (Hooks_Package::HasValidLicense(appId)) {
+                return;
             }
+
+            CMsgProtoBufHeader hdrMsg;
+            bool hdrChanged = false;
+            if (!pkt.hdr.empty() &&
+                hdrMsg.ParseFromArray(pkt.hdr.data(), static_cast<int>(pkt.hdr.size())) &&
+                hdrMsg.has_eresult() && hdrMsg.eresult() != k_EResultOK)
+            {
+                hdrMsg.set_eresult(k_EResultOK);
+                if (hdrMsg.has_error_message()) {
+                    hdrMsg.clear_error_message();
+                }
+                hdrChanged = true;
+                LOG_ACHIEVEMENT_DEBUG("ClientStoreUserStats response: patched header eresult to OK for app {}", appId);
+            }
+
+            bool bodyChanged = false;
+            if (resp.eresult() != k_EResultOK) {
+                resp.set_eresult(k_EResultOK);
+                bodyChanged = true;
+            }
+            if (resp.has_stats_failed_validation()) {
+                resp.clear_stats_failed_validation();
+                bodyChanged = true;
+            }
+
+            if (hdrChanged || bodyChanged) {
+                if (CommitRecvPacket(pPacket, pkt, hdrChanged ? &hdrMsg : nullptr, bodyChanged ? &resp : nullptr)) {
+                    LOG_ACHIEVEMENT_DEBUG("ClientStoreUserStats response: committed patched response for app {}", appId);
+                }
+            }
+
+            // Dual-stage notification: confirm stats store off-thread (coalesces with 820 send)
+            CloudRedirectHost::NotifyStatsStored(appId);
+        } catch (const std::exception& e) {
+            LOG_ACHIEVEMENT_ERROR("ClientStoreUserStats response caught exception: {}", e.what());
+        } catch (...) {
+            LOG_ACHIEVEMENT_ERROR("ClientStoreUserStats response caught unknown exception");
         }
     }
 
 } // namespace Hooks_NetPacket_UserStats
+
+// ════════════════════════════════════════════════════════════════
+//  Hooks_NetPacket_Playtime
+//
+//  Incoming: CPlayer_GetLastPlayedTimes_Response (eMsg 147 ← target: Player.ClientGetLastPlayedTimes#1)
+// ════════════════════════════════════════════════════════════════
+namespace Hooks_NetPacket_Playtime {
+
+    void HandleRecv_ClientGetLastPlayedTimesResponse(CNetPacket* pPacket,
+                                                     const UnpackedPacket& pkt)
+    {
+        if (!CloudRedirectHost::IsActive()) return;
+
+        CPlayer_GetLastPlayedTimes_Response resp;
+        if (!pkt.body.empty()) {
+            if (!resp.ParseFromArray(pkt.body.data(), static_cast<int>(pkt.body.size()))) {
+                LOG_NETPACKET_WARN("Player::ClientGetLastPlayedTimes response: failed to ParseFromArray");
+                return;
+            }
+        }
+
+        // Map existing games by appid for in-place update or deduplication
+        std::unordered_map<int32_t, CPlayer_GetLastPlayedTimes_Response::Game*> existing;
+        if (resp.games_size() > 0) {
+            existing.reserve(static_cast<size_t>(resp.games_size()));
+            for (int i = 0; i < resp.games_size(); ++i) {
+                existing[resp.games(i).appid()] = resp.mutable_games(i);
+            }
+        }
+
+        bool modified = false;
+        const auto appIds = CloudRedirectHost::GetRedirectedAppIds();
+        for (const AppId_t appId : appIds) {
+            // Strictly protect officially owned and family shared assets
+            if (Hooks_Package::HasValidLicense(appId)) {
+                continue;
+            }
+
+            CloudRedirectHost::PlaytimeInfo pt{};
+            if (!CloudRedirectHost::GetPlaytime(appId, &pt)) {
+                continue;
+            }
+            if (pt.minutesForever == 0 && pt.lastPlayedTime == 0) {
+                continue;
+            }
+
+            auto it = existing.find(static_cast<int32_t>(appId));
+            auto* g = (it != existing.end()) ? it->second : resp.add_games();
+            g->set_appid(static_cast<int32_t>(appId));
+            g->set_playtime_forever(static_cast<int32_t>(pt.minutesForever));
+            g->set_playtime_2weeks(static_cast<int32_t>(pt.minutesLastTwoWeeks));
+            g->set_last_playtime(pt.lastPlayedTime);
+            if (pt.playtimeWindows) g->set_playtime_windows_forever(static_cast<int32_t>(pt.playtimeWindows));
+            if (pt.playtimeMac)     g->set_playtime_mac_forever(static_cast<int32_t>(pt.playtimeMac));
+            if (pt.playtimeLinux)   g->set_playtime_linux_forever(static_cast<int32_t>(pt.playtimeLinux));
+
+            modified = true;
+            LOG_NETPACKET_DEBUG("Player::ClientGetLastPlayedTimes response: merged appid={} (forever={}m, last={})",
+                                appId, pt.minutesForever, pt.lastPlayedTime);
+        }
+
+        if (modified) {
+            if (CommitRecvPacket(pPacket, pkt, nullptr, &resp)) {
+                LOG_NETPACKET_INFO("Player::ClientGetLastPlayedTimes response: successfully committed merged playtime data");
+            }
+        }
+    }
+
+} // namespace Hooks_NetPacket_Playtime
+
 
 
 
@@ -2378,12 +2460,11 @@ namespace {
                     }
                 }
             }
-            if (appId == 0) {
-                appId = Hooks_NetPacket_RichPresence::g_PlayingAppId.load(std::memory_order_relaxed);
-            }
+            if (appId == 0) return;
+
             appId = ResolveOnlineFixAppId(appId);
-            if (appId != 0 && !Hooks_Package::HasValidLicense(appId) &&
-                (LuaConfig::HasDepot(appId) || CloudRedirectHost::IsApp(appId))) {
+            if ((LuaConfig::HasDepot(appId) || CloudRedirectHost::IsApp(appId)) &&
+                !Hooks_Package::HasValidLicense(appId)) {
                 CloudRedirectHost::NotifyStatsStored(appId);
             }
             return;
@@ -2409,6 +2490,10 @@ namespace {
 
         case HASH_JOB_GetUserStats:
             Hooks_NetPacket_UserStats::HandleRecv_GetUserStatsResponse(pPacket, pkt, hdr);
+            return;
+
+        case HASH_JOB_ClientGetLastPlayedTimes:
+            Hooks_NetPacket_Playtime::HandleRecv_ClientGetLastPlayedTimesResponse(pPacket, pkt);
             return;
 
         case HASH_JOB_GetManifestRequestCode:
