@@ -49,6 +49,11 @@ namespace {
             interfaces.push_back(std::move(iface));
         }
 
+        [[nodiscard]] bool HasInterface(std::string_view name) const noexcept
+        {
+            return byName.find(std::string(name)) != byName.end();
+        }
+
         void BuildIndex()
         {
             byMethodHash.clear();
@@ -238,52 +243,101 @@ namespace {
             "       https://github.com/Contrary7/SteamDaddy-Backup/issues");
     }
 
-} // namespace
+    constexpr const char* kIPCChannel = "ipc";
+    constexpr const char* kRequiredInterfaces[] = { "IClientUser", "IClientUtils" };
 
-constexpr const char* kIPCChannel = "ipc";
+    static bool HasRequiredInterfaces(const Registry& reg)
+    {
+        for (const char* name : kRequiredInterfaces) {
+            if (!reg.HasInterface(name)) return false;
+        }
+        return true;
+    }
+
+    enum class TryResult { Ok, Retryable, Fatal };
+
+    static TryResult TryLoadOnce(const std::string& steamclientPath, std::string& sha256, bool& fromCache, bool& allNotFound, Registry& outReg)
+    {
+        RemoteToml::Result r = RemoteToml::Fetch({
+            kIPCChannel,
+            "steamclient",
+            steamclientPath,
+        });
+        sha256 = r.sha256;
+        fromCache = r.fromCache;
+        allNotFound = r.allNotFound;
+
+        if (!r.ok) return TryResult::Fatal;
+
+        Registry localRegistry;
+        try {
+            toml::table root = toml::parse(r.body);
+            for (auto& [key, val] : root) {
+                if (!val.is_table()) continue;
+                Interface iface;
+                if (!ParseInterfaceTable(key.str(), *val.as_table(), iface)) continue;
+
+                localRegistry.Add(std::move(iface));
+            }
+        } catch (const toml::parse_error& e) {
+            LOG_WARN("IPCLoader: TOML parse error: {}", e.description());
+            return fromCache ? TryResult::Retryable : TryResult::Fatal;
+        }
+
+        if (!HasRequiredInterfaces(localRegistry)) {
+            return fromCache ? TryResult::Retryable : TryResult::Fatal;
+        }
+
+        localRegistry.BuildIndex();
+        outReg = std::move(localRegistry);
+        return TryResult::Ok;
+    }
+
+} // namespace
 
 bool Load(const std::string& steamclientPath)
 {
-    RemoteToml::Result r = RemoteToml::Fetch({
-        kIPCChannel,
-        "steamclient",
-        steamclientPath,
-    });
+    std::string sha256;
+    bool fromCache = false;
+    bool allNotFound = false;
+    Registry loadedReg;
 
-    if (!r.ok) {
-        ShowMissingPopup(r.sha256.empty() ? "(hash failed)" : r.sha256);
-        return false;
-    }
-
-    Registry localRegistry;
-
-    try {
-        toml::table root = toml::parse(r.body);
-        for (auto& [key, val] : root) {
-            if (!val.is_table()) continue;
-            Interface iface;
-            if (!ParseInterfaceTable(key.str(), *val.as_table(), iface)) continue;
-
-            localRegistry.Add(std::move(iface));
+    const TryResult first = TryLoadOnce(steamclientPath, sha256, fromCache, allNotFound, loadedReg);
+    if (first == TryResult::Ok) {
+        {
+            std::unique_lock<std::shared_mutex> lock(g_ipcMutex);
+            g_registry = std::move(loadedReg);
         }
-    } catch (const toml::parse_error& e) {
-        LOG_WARN("IPCLoader: TOML parse error: {}", e.description());
-        ShowMissingPopup(r.sha256);
-        return false;
+        LOG_INFO("IPCLoader: loaded {} methods across {} interfaces ({})",
+                 MethodCount(), InterfaceCount(),
+                 fromCache ? "cache" : "remote");
+        return true;
     }
 
-    localRegistry.BuildIndex();
-
-    // Atomic commit under exclusive lock (Strong Exception Safety)
-    {
-        std::unique_lock<std::shared_mutex> lock(g_ipcMutex);
-        g_registry = std::move(localRegistry);
+    // Self-heal when cache is stale or truncated: drop cache and refetch once
+    if (first == TryResult::Retryable) {
+        LOG_WARN("IPCLoader: parsed spec missing required interfaces, dropping stale cache and refetching once");
+        RemoteToml::Invalidate({ kIPCChannel, "steamclient", steamclientPath });
+        if (TryLoadOnce(steamclientPath, sha256, fromCache, allNotFound, loadedReg) == TryResult::Ok) {
+            {
+                std::unique_lock<std::shared_mutex> lock(g_ipcMutex);
+                g_registry = std::move(loadedReg);
+            }
+            LOG_INFO("IPCLoader: self-heal ok, loaded {} methods across {} interfaces ({})",
+                     MethodCount(), InterfaceCount(),
+                     fromCache ? "cache" : "remote");
+            return true;
+        }
     }
 
-    LOG_INFO("IPCLoader: loaded {} methods across {} interfaces ({})",
-             MethodCount(), InterfaceCount(),
-             r.fromCache ? "cache" : "remote");
-    return true;
+    if (allNotFound) {
+        LOG_ERROR("IPCLoader: IPC spec not published upstream, IPC interception disabled for this session");
+        ShowMissingPopup(sha256.empty() ? "(hash failed)" : sha256);
+    } else {
+        LOG_ERROR("IPCLoader: IPC spec unavailable (network or bad upstream content), "
+                  "IPC interception disabled for this session without popup; will retry next launch");
+    }
+    return false;
 }
 
 const Method* Find(EIPCInterface interfaceID, uint32_t funcHash)
