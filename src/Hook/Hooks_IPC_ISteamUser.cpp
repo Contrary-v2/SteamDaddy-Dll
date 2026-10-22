@@ -72,7 +72,12 @@ namespace {
         // Genuinely owned and family shared apps: OST must NEVER touch or spoof SteamID,
         // unless Scheme 2 (-dauth2 / dauth2(appid)) is explicitly requested.
         // Preserves player's authentic identity, local save directory, and native Steam Cloud.
-        if (Hooks_Package::HasValidLicense(appId) && !LuaConfig::IsDAuth2(appId)) return;
+        if (Hooks_Package::HasValidLicense(appId) && !LuaConfig::IsDAuth2(appId)) {
+            // Do not alter identity, but window close must still be observed: early return bypasses
+            // IsAuthorizedPipe, which would prevent authentic SteamID from persisting.
+            PipeManager::DenuvoAuth::ObserveWindowClose(pipe);
+            return;
+        }
 
         GetSteamIDResp resp{pWrite};
         if (!resp.ok()) return;
@@ -91,6 +96,9 @@ namespace {
         uint64 spoofed = AppTicket::GetSpoofSteamID(appId);
         if (!spoofed) {
             spoofed = AppTicket::GetTicketSteamID(appId);
+        }
+        if (!spoofed) {
+            spoofed = AppTicket::GetForgeSteamID(appId);
         }
         if (!spoofed) {
             return;

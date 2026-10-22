@@ -12,6 +12,10 @@ namespace PipeManager::DenuvoAuth {
     // within the active authorization window (startup grace period or ticket lease).
     [[nodiscard]] bool IsAuthorizedPipe(const CPipeClient* pipe);
 
+    // Observes authorization window closure and executes end-authorization persistence
+    // (genuine/shared games release GetSteamID early, so they must be observed here).
+    void ObserveWindowClose(const CPipeClient* pipe);
+
     // True if the pipe belongs to a process detected or forced as Denuvo.
     [[nodiscard]] bool IsDenuvoPipe(const CPipeClient* pipe);
 

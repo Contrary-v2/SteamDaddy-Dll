@@ -7,10 +7,14 @@
 
 #include "Pipe/Features/DenuvoAuth/ProtectionScan.h"
 #include "Pipe/Features/DenuvoAuth/DenuvoSync.h"
+#include "Hook/Hooks_Package.h"
 #include "Utils/Logging/Log.h"
 #include "Utils/Config/LuaConfig.h"
+#include "Utils/Tickets/AppTicket.h"
 #include "Pipe/ProcessInspector.h"
 #include "OSTPlatform/include/Process.h"
+#include "OSTPlatform/include/SteamCredentialStore.h"
+#include "Steam/Types.h"
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -57,6 +61,43 @@ namespace {
         return "?";
     }
 
+    bool EqualsUniverseName(std::wstring_view actual, std::wstring_view expected) {
+        if (actual.size() != expected.size()) return false;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            if (towlower(actual[i]) != towlower(expected[i])) return false;
+        }
+        return true;
+    }
+
+    EUniverse ParseUniverse(std::wstring_view universe) {
+        if (EqualsUniverseName(universe, L"Public")) return k_EUniversePublic;
+        if (EqualsUniverseName(universe, L"Beta")) return k_EUniverseBeta;
+        if (EqualsUniverseName(universe, L"Internal")) return k_EUniverseInternal;
+        if (EqualsUniverseName(universe, L"Dev")) return k_EUniverseDev;
+        return k_EUniverseInvalid;
+    }
+
+    std::optional<uint64> GetCurrentSteamIdForDenuvoAuth() {
+        uint32 accountId = 0;
+        std::wstring universeName;
+        const auto status = OSTPlatform::SteamCredentialStore::GetActiveUser(accountId, universeName);
+        if (status != OSTPlatform::SteamCredentialStore::Status::Ok) {
+            LOG_PIPE_WARN("DenuvoAuth: active Steam user unavailable ({})",
+                           OSTPlatform::SteamCredentialStore::ToString(status));
+            return std::nullopt;
+        }
+
+        const EUniverse universe = ParseUniverse(universeName);
+        if (universe == k_EUniverseInvalid) {
+            LOG_PIPE_WARN("DenuvoAuth: active Steam user has unsupported universe");
+            return std::nullopt;
+        }
+
+        CSteamID steamId;
+        steamId.Set(accountId, universe, k_EAccountTypeIndividual);
+        return steamId.ConvertToUint64();
+    }
+
     struct ProcessAuth {
         bool scanned = false;
         bool denuvo = false;
@@ -74,6 +115,7 @@ namespace {
 
         AppId_t authorizedAppId = k_uAppIdInvalid;
         uint32 handshakeCount = 0;
+        bool steamIdPersisted = false;
 
         bool operator==(const ProcessAuth&) const = default;
         auto operator<=>(const ProcessAuth&) const = default;
@@ -208,6 +250,29 @@ namespace {
             const auto now = std::chrono::steady_clock::now();
             return now <= deadline;
         }
+
+        void WriteSteamIdOnEndAuthorization() const {
+            if (authorizedAppId == k_uAppIdInvalid) {
+                LOG_PIPE_WARN("DenuvoAuth: end authorization skipped SteamID persist without auth app");
+                return;
+            }
+
+            const std::optional<uint64> steamId = GetCurrentSteamIdForDenuvoAuth();
+            if (!steamId || *steamId == 0) {
+                LOG_PIPE_WARN("DenuvoAuth: end authorization no current SteamID source auth_appid={}",
+                               authorizedAppId);
+                return;
+            }
+
+            if (AppTicket::WriteSteamID(authorizedAppId, *steamId)) {
+                LOG_PIPE_INFO("DenuvoAuth: persisted end-authorization SteamID auth_appid={} steamid={}",
+                              authorizedAppId, *steamId);
+                return;
+            }
+
+            LOG_PIPE_WARN("DenuvoAuth: failed to persist end-authorization SteamID auth_appid={} steamid={}",
+                          authorizedAppId, *steamId);
+        }
     };
 
     std::mutex g_authMutex;
@@ -283,6 +348,20 @@ namespace {
         }
 
         return nullptr;
+    }
+
+    // End-authorization persistence is performed once: when window close is first observed,
+    // authentic SteamID is persisted for native userdata save compatibility.
+    // Only valid licenses (truly owned or family shared) are persisted so that borrowed
+    // tickets do not pollute authentic save game state.
+    void MaybePersistSteamIdOnWindowClose(ProcessAuth& auth) {
+        if (auth.steamIdPersisted) return;
+        if (!auth.denuvo || !auth.startupArmed) return;
+        if (auth.CurrentStage(std::chrono::steady_clock::now()) != Stage::EndAuthorization) return;
+        auth.steamIdPersisted = true;
+        if (Hooks_Package::HasValidLicense(auth.authorizedAppId)) {
+            auth.WriteSteamIdOnEndAuthorization();
+        }
     }
 
 } // namespace
@@ -487,18 +566,29 @@ bool IsAuthorizedPipe(const CPipeClient* pipe) {
 
     const PipeKey pipeKey = MakePipeKey(pipe);
     std::lock_guard lock(g_authMutex);
-    const ProcessAuth* auth = FindAuthForPipe(pipeKey);
+    ProcessAuth* auth = FindAuthForPipe(pipeKey);
     if (!auth) {
         LOG_PIPE_TRACE("DenuvoAuth: pipe not tracked by DenuvoAuth {}", pipeKey.DebugString());
         return false;
     }
 
     if (!auth->CanUseAuthorizedIdentity()) {
+        MaybePersistSteamIdOnWindowClose(*auth);
         LOG_PIPE_TRACE("DenuvoAuth: pipe outside authorization window {} {}", pipeKey.DebugString(), auth->DebugString());
         return false;
     }
     LOG_PIPE_DEBUG("DenuvoAuth: pipe in authorization window {} {}", pipeKey.DebugString(), auth->DebugString());
     return true;
+}
+
+void ObserveWindowClose(const CPipeClient* pipe) {
+    if (!pipe) return;
+    const PipeKey pipeKey = MakePipeKey(pipe);
+    std::lock_guard lock(g_authMutex);
+    ProcessAuth* auth = FindAuthForPipe(pipeKey);
+    if (auth) {
+        MaybePersistSteamIdOnWindowClose(*auth);
+    }
 }
 
 bool IsDenuvoPipe(const CPipeClient* pipe) {
