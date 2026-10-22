@@ -169,7 +169,7 @@ static void ShowDownloadFailedPopup(const std::string& dllName,
         "  2. Drop a matching TOML at:\n"
         "       " + rootLabel + "\\steamdaddy\\pattern\\" + component + "\\" + sha256 + ".toml\n"
         "  3. Check upstream repository:\n"
-        "       https://github.com/hazre/steam-monitor/tree/main/pattern/" + component + "\n"
+        "       https://github.com/huanyuejue/steam-monitor/tree/main/pattern/" + component + "\n"
         "  4. Report diagnostics at:\n"
         "       https://github.com/Contrary7/SteamDaddy-Backup/issues");
 }

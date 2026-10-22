@@ -18,8 +18,9 @@ namespace RemoteToml {
 namespace {
     // Upstream pattern repositories:
     // 1. mmxlyo/steam-monitor: full signature coverage (including GetRedirectedAppId & RemoteStorage_ResolvePath)
-    // 2. madoiscool/steam-monitor: automated mirror fallback
-    // 3. hazre/steam-monitor: original OpenSteamTool pattern branch
+    // 2. huanyuejue/steam-monitor: upstream fork covering newest stable+beta builds
+    // 3. madoiscool/steam-monitor: automated mirror fallback
+    // 4. hazre/steam-monitor: original OpenSteamTool pattern branch
     constexpr const char* kMmxlyoJsdelivrTemplate =
         "https://cdn.jsdelivr.net/gh/mmxlyo/steam-monitor@{channel}/{component}/{sha256}.toml";
     constexpr const char* kMmxlyoGithubTemplate =
@@ -28,6 +29,15 @@ namespace {
     constexpr const char* kMmxlyoGhProxyTemplate =
         "https://gh-proxy.com/https://raw.githubusercontent.com/mmxlyo/steam-monitor/"
         "{channel}/{component}/{sha256}.toml";
+
+    constexpr const char* kHuanyuejueJsdelivrTemplate =
+        "https://cdn.jsdelivr.net/gh/huanyuejue/steam-monitor@main/{channel}/{component}/{sha256}.toml";
+    constexpr const char* kHuanyuejueGithubTemplate =
+        "https://raw.githubusercontent.com/huanyuejue/steam-monitor/"
+        "main/{channel}/{component}/{sha256}.toml";
+    constexpr const char* kHuanyuejueGhProxyTemplate =
+        "https://gh-proxy.com/https://raw.githubusercontent.com/huanyuejue/steam-monitor/"
+        "main/{channel}/{component}/{sha256}.toml";
 
     constexpr const char* kMadoiscoolJsdelivrTemplate =
         "https://cdn.jsdelivr.net/gh/madoiscool/steam-monitor@{channel}/{component}/{sha256}.toml";
@@ -100,6 +110,10 @@ namespace {
             templates.push_back(kMmxlyoGithubTemplate);
             templates.push_back(kMmxlyoJsdelivrTemplate);
             templates.push_back(kMmxlyoGhProxyTemplate);
+            // huanyuejue primary fork
+            templates.push_back(kHuanyuejueGithubTemplate);
+            templates.push_back(kHuanyuejueJsdelivrTemplate);
+            templates.push_back(kHuanyuejueGhProxyTemplate);
             // madoiscool fallback
             templates.push_back(kMadoiscoolGithubTemplate);
             templates.push_back(kMadoiscoolJsdelivrTemplate);
@@ -113,6 +127,10 @@ namespace {
             templates.push_back(kMmxlyoGhProxyTemplate);
             templates.push_back(kMmxlyoJsdelivrTemplate);
             templates.push_back(kMmxlyoGithubTemplate);
+            // huanyuejue primary fork
+            templates.push_back(kHuanyuejueGhProxyTemplate);
+            templates.push_back(kHuanyuejueJsdelivrTemplate);
+            templates.push_back(kHuanyuejueGithubTemplate);
             // madoiscool fallback
             templates.push_back(kMadoiscoolGhProxyTemplate);
             templates.push_back(kMadoiscoolJsdelivrTemplate);
@@ -127,6 +145,10 @@ namespace {
             templates.push_back(kMmxlyoJsdelivrTemplate);
             templates.push_back(kMmxlyoGithubTemplate);
             templates.push_back(kMmxlyoGhProxyTemplate);
+            // huanyuejue primary fork
+            templates.push_back(kHuanyuejueJsdelivrTemplate);
+            templates.push_back(kHuanyuejueGithubTemplate);
+            templates.push_back(kHuanyuejueGhProxyTemplate);
             // madoiscool fallback
             templates.push_back(kMadoiscoolJsdelivrTemplate);
             templates.push_back(kMadoiscoolGithubTemplate);
