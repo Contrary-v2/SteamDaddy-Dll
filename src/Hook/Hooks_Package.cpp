@@ -60,6 +60,7 @@ namespace {
     std::atomic<PackageInfo*>                   g_pInjectedPackageInfo{nullptr};
     std::atomic<bool>                           g_licenseInitialized{false};
     std::atomic<bool>                           g_licenseRefreshPending{false};
+    std::atomic<bool>                           g_forceRequeryOnce{false};
     std::shared_mutex                           g_sharedLicensesMutex;
     NoDestructor<std::unordered_set<AppId_t>>   g_sharedLicenses;
     std::atomic<bool>                           g_hasSharedLicenses{false};
@@ -415,7 +416,11 @@ namespace {
         bool result = origCheckAppOwnership(pObj, appId, pEffectiveOwn);
         TryInitFakeLicenseOnce();
 
-
+        // Late-hook bootstrapping latch: force a license re-query once captured CUser is ready
+        if (!g_licenseInitialized.load(std::memory_order_acquire) && g_forceRequeryOnce.exchange(false, std::memory_order_acq_rel)) {
+            LOG_PACKAGE_INFO("CheckAppOwnership: priming license re-query after late hook install");
+            MarkLicenseAsChangedAndProcessUpdates();
+        }
 
         TryProcessPendingLicenseRefresh();
 
@@ -644,7 +649,6 @@ namespace Hooks_Package {
     }
 
     void RequestRequeryOnce() {
-        g_licenseRefreshPending.store(true, std::memory_order_release);
-        TryProcessPendingLicenseRefresh();
+        g_forceRequeryOnce.store(true, std::memory_order_release);
     }
 }
