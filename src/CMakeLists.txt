@@ -123,6 +123,12 @@ add_library(version SHARED
     version/version.rc
 )
 
+add_library(xinput1_4 SHARED
+    xinput1_4/xinput1_4.cpp
+    xinput1_4/xinput1_4.def
+    xinput1_4/xinput1_4.rc
+)
+
 # ---------------------------------------------------------------------------
 # Dependency recipes (FetchContent-backed, cached at <repo>/.deps).
 # ---------------------------------------------------------------------------
@@ -295,6 +301,9 @@ if(TARGET version)
 endif()
 if(TARGET dwmapi)
     add_dependencies(SteamDaddy dwmapi)
+endif()
+if(TARGET xinput1_4)
+    add_dependencies(SteamDaddy xinput1_4)
 endif()
 
 

@@ -70,8 +70,8 @@ echo.
 echo ===========================================================================
 echo [OK] Build completed successfully.
 echo Output DLLs:
-if exist "build\Release\SteamDaddy.dll" echo   [Release] build\Release\SteamDaddy.dll, dwmapi.dll, version.dll
-if exist "build\Debug\SteamDaddy.dll"   echo   [Debug]   build\Debug\SteamDaddy.dll, dwmapi.dll, version.dll
+if exist "build\Release\SteamDaddy.dll" echo   [Release] build\Release\SteamDaddy.dll, dwmapi.dll, version.dll, xinput1_4.dll
+if exist "build\Debug\SteamDaddy.dll"   echo   [Debug]   build\Debug\SteamDaddy.dll, dwmapi.dll, version.dll, xinput1_4.dll
 echo ===========================================================================
 exit /b 0
 
