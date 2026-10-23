@@ -270,6 +270,31 @@ namespace LuaConfig{
         }
     }
 
+    static void RebuildLegacyCDKey(AppId_t appId) {
+        const std::string* best = nullptr;
+        uint64_t bestSeq = 0;
+
+        for (const auto& [file, keys] : g_fileLegacyCDKeys) {
+            auto it = keys.find(appId);
+            if (it == keys.end()) continue;
+
+            auto seqIt = g_fileParseSequence.find(file);
+            if (seqIt == g_fileParseSequence.end()) continue;
+
+            if (!best || seqIt->second > bestSeq) {
+                best = &it->second;
+                bestSeq = seqIt->second;
+            }
+        }
+
+        if (best) {
+            LegacyCDKeySet[appId] = *best;
+        } else {
+            LegacyCDKeySet.erase(appId);
+        }
+    }
+
+
     // ── Lua HTTP helpers ──────────────────────────────────────────
     //   http_get(url [, headers]) → body, status_code
     //     headers: optional table, e.g. {["Accept"]="application/json"}
@@ -558,7 +583,7 @@ namespace LuaConfig{
             return luaL_error(L, "setlegacycdkey: argument 1 must be integer appid");
         }
         lua_Integer value = lua_tointeger(L, 1);
-        if (value < 0 || value > UINT32_MAX)
+        if (value <= 0 || value > UINT32_MAX)
             return luaL_error(L, "setlegacycdkey: appid out of range");
         AppId_t AppId = static_cast<AppId_t>(value);
         if (!lua_isstring(L, 2))
@@ -566,10 +591,11 @@ namespace LuaConfig{
 
         const char* keyStr = lua_tostring(L, 2);
         std::string key = keyStr ? keyStr : "";
-        std::unique_lock lock(g_configSharedMutex);
-        LegacyCDKeySet[AppId] = key;
         if (!g_currentFile.empty()) {
             g_fileLegacyCDKeys[g_currentFile][AppId] = key;
+            RebuildLegacyCDKey(AppId);
+        } else {
+            LegacyCDKeySet[AppId] = key;
         }
         return 0;
     }
@@ -771,6 +797,7 @@ namespace LuaConfig{
         register_func(g_lua_state, "setappticket", lua_setAppticket);
         register_func(g_lua_state, "seteticket", lua_setEticket);
         register_func(g_lua_state, "setstat", lua_setStat);
+        register_func(g_lua_state, "setlegacycdkey", lua_setlegacycdkey);
         return true;
     }
 
@@ -1093,13 +1120,15 @@ namespace LuaConfig{
         auto pinnedIt = g_filePinnedApps.find(filePath);
         auto statIt = g_fileStats.find(filePath);
         auto eticketUrlIt = g_fileEticketUrl.find(filePath);
+        auto legacyCdKeyIt = g_fileLegacyCDKeys.find(filePath);
 
         if (depotsIt == g_fileDepots.end() && manifestIt == g_fileManifestOverrides.end() &&
             appTicketIt == g_fileAppTickets.end() && eTicketIt == g_fileETickets.end() &&
             tokenIt == g_fileTokens.end() &&
             procIt == g_fileProcesses.end() && forcedIt == g_fileForcedDenuvo.end() &&
             noDenuvoIt == g_fileNoDenuvo.end() && dauth2It == g_fileDAuth2.end() && pinnedIt == g_filePinnedApps.end() &&
-            statIt == g_fileStats.end() && eticketUrlIt == g_fileEticketUrl.end()) {
+            statIt == g_fileStats.end() && eticketUrlIt == g_fileEticketUrl.end() &&
+            legacyCdKeyIt == g_fileLegacyCDKeys.end()) {
             g_fileParseSequence.erase(filePath);
             g_fileMtime.erase(filePath);
             return;
@@ -1261,6 +1290,18 @@ namespace LuaConfig{
         if (eticketUrlIt != g_fileEticketUrl.end()) {
             g_fileEticketUrl.erase(eticketUrlIt);
             RebuildEticketUrl();
+        }
+
+        if (legacyCdKeyIt != g_fileLegacyCDKeys.end()) {
+            std::vector<AppId_t> affectedKeys;
+            affectedKeys.reserve(legacyCdKeyIt->second.size());
+            for (const auto& [appId, _] : legacyCdKeyIt->second) {
+                affectedKeys.push_back(appId);
+            }
+            g_fileLegacyCDKeys.erase(legacyCdKeyIt);
+            for (AppId_t appId : affectedKeys) {
+                RebuildLegacyCDKey(appId);
+            }
         }
 
         if (!g_manifestCodeFuncFile.empty() && filePath == g_manifestCodeFuncFile) {
