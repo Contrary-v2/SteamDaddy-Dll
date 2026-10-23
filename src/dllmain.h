@@ -21,6 +21,7 @@ inline std::atomic<bool> g_HooksInstalled{false};
 inline std::atomic<bool> g_IsDiversionActive{false};
 // Steam whether diversion shadow copy was adopted by SteamUI LoadModuleWithPath dispatch.
 inline std::atomic<bool> g_DiversionAdopted{false};
+inline std::atomic<bool> g_steamClientMappedAtAttach{false};
 
 inline constexpr size_t kRuntimePathCapacity = 1024;
 

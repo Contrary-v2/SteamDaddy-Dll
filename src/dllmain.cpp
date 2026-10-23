@@ -139,9 +139,11 @@ static bool InitializeSteamComponents(OSTPlatform::DynamicLibrary::ModuleHandle 
 {
     using OSTPlatform::Encoding::PathFromUtf8;
 
+    const bool diversionEnabled = !g_steamClientMappedAtAttach.load(std::memory_order_acquire);
+
     // Load or adopt client module (diversion or fallback to real steamclient64.dll)
     if (!client_hModule.load(std::memory_order_acquire)) {
-        if (g_IsDiversionActive.load(std::memory_order_acquire)) {
+        if (diversionEnabled && g_IsDiversionActive.load(std::memory_order_acquire)) {
             auto h = OSTPlatform::DynamicLibrary::Load(PathFromUtf8(DiversionPath));
             if (h) {
                 auto expected = static_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(nullptr);
@@ -150,6 +152,7 @@ static bool InitializeSteamComponents(OSTPlatform::DynamicLibrary::ModuleHandle 
             }
         }
         if (!client_hModule.load(std::memory_order_acquire)) {
+            g_IsDiversionActive.store(false, std::memory_order_release);
             auto h = OSTPlatform::DynamicLibrary::Load(PathFromUtf8(SteamclientPath));
             if (!h) {
                 LOG_ERROR("Load steamclient64.dll failed: {} (err={})",
@@ -158,7 +161,11 @@ static bool InitializeSteamComponents(OSTPlatform::DynamicLibrary::ModuleHandle 
             }
             auto expected = static_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(nullptr);
             client_hModule.compare_exchange_strong(expected, h);
-            LOG_INFO("Loaded fallback steamclient64.dll from {} (Diversion inactive)", SteamclientPath);
+            if (diversionEnabled) {
+                LOG_INFO("Loaded fallback steamclient64.dll from {} (Diversion inactive)", SteamclientPath);
+            } else {
+                LOG_INFO("Diversion bypassed (steamclient64.dll already mapped at attach, late loader mode) -> hooking live {}", SteamclientPath);
+            }
             Hooks_Package::RequestRequeryOnce();
         }
     }
@@ -319,13 +326,27 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved)
         // 1. Resolve key runtime paths early at process load time (0ms)
         InitializeRuntimePaths(selfMod);
 
-        // 2. Synchronize diversion shadow module if needed
-        Hooks_Diversion::EnsureDiversionFileReady(
-            OSTPlatform::Encoding::Utf8ToWide(SteamclientPath),
-            OSTPlatform::Encoding::Utf8ToWide(DiversionPath));
+        // Check if steamclient64.dll is already in memory upon attach!
+        // When loaded via xinput1_4.dll or dwmapi.dll (late loader), steamclient64.dll
+        // is ALREADY mapped. Diversion cannot be swapped in, so we bypass diversion
+        // and hook the live steamclient64.dll directly!
+        const bool steamClientAlreadyMapped = (::GetModuleHandleW(L"steamclient64.dll") != nullptr);
+        g_steamClientMappedAtAttach.store(steamClientAlreadyMapped, std::memory_order_release);
 
-        // 3. Synchronously hook KERNELBASE!LoadLibraryExW at 0ms
-        Hooks_Diversion::Install();
+        if (!steamClientAlreadyMapped)
+        {
+            // 2. Synchronize diversion shadow module if needed
+            Hooks_Diversion::EnsureDiversionFileReady(
+                OSTPlatform::Encoding::Utf8ToWide(SteamclientPath),
+                OSTPlatform::Encoding::Utf8ToWide(DiversionPath));
+
+            // 3. Synchronously hook KERNELBASE!LoadLibraryExW at 0ms
+            Hooks_Diversion::Install();
+        }
+        else
+        {
+            g_IsDiversionActive.store(false, std::memory_order_release);
+        }
 
         // 4. Keep this module pinned so explicit FreeLibrary cannot unload code
         // while hooks and worker threads may still reference it.
@@ -348,7 +369,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved)
         // During process termination (pvReserved != nullptr), OS terminates all threads
         // before calling DllMain; avoid joining dead threads or performing loader-lock unhooks.
         if (pvReserved == nullptr) {
-            Hooks_Diversion::Uninstall();
+            if (!g_steamClientMappedAtAttach.load(std::memory_order_acquire)) {
+                Hooks_Diversion::Uninstall();
+            }
             ConfigFileWatcher::Stop();
             LuaFileWatcher::Stop();
             HookManager::UninstallClientHooks();
