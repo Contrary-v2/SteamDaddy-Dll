@@ -1,4 +1,5 @@
 #include "Hooks_NetPacket.h"
+#include "Hooks_Decryption.h"
 #include "Hooks_Package.h"
 #include "Utils/SteamMetadata/ManifestClient.h"
 #include "Hooks_Misc.h"
@@ -32,6 +33,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -966,6 +968,8 @@ namespace Hooks_NetPacket_OwnershipTicket {
             if (resp.has_ticket() && !resp.ticket().empty()) {
                 const auto& t = resp.ticket();
                 const auto span = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(t.data()), t.size());
+                // Passively cache into in-memory ticket store for forge fallback
+                Hooks_Decryption::CacheAppOwnershipTicket(appId, span.data(), span.size());
                 if (PipeManager::IsToolActiveForApp(appId)) {
                     LOG_NETPACKET_INFO("OwnershipTicketResponse[858]: appId={} requested by active tool — skipping Lua disk sync", appId);
                     AppTicket::WriteAppOwnershipTicket(appId, span);
@@ -2337,6 +2341,141 @@ namespace Hooks_NetPacket_LegacyKey {
 } // namespace Hooks_NetPacket_LegacyKey
 
 // ════════════════════════════════════════════════════════════════
+//  Ownership ticket on-demand fetch (eMsg 857/858).
+//
+//  Captures the WebSocket send context from outgoing frames, then
+//  originates eMsg 857 (ClientGetAppOwnershipTicket) requests when
+//  no ticket is in memory cache or ConfigStore.  The eMsg 858 recv
+//  handler in RecvJob already caches arriving tickets via
+//  Hooks_Decryption::CacheAppOwnershipTicket; WaitForCachedTicket
+//  blocks until one arrives or times out.
+// ════════════════════════════════════════════════════════════════
+namespace Hooks_NetPacket_TicketFetch {
+
+    using SendFrameFn = bool(__fastcall*)(void*, EWebSocketOpCode, uint8*, uint32);
+
+    std::mutex   g_ContextMutex;
+    void*        g_pWebSocket = nullptr;
+    SendFrameFn  g_sendFrame  = nullptr;
+    std::vector<uint8> g_HdrTemplate;
+
+    std::mutex                      g_Mutex;
+    std::unordered_set<AppId_t>     g_Failed;
+    uint64 g_NextJobId = 0x7E52'0000'0000'0000ull;
+
+    void CaptureContext(void* pObject, SendFrameFn sendFrame,
+                        const uint8* pHdr, uint32 cbHdr)
+    {
+        std::lock_guard<std::mutex> lock(g_ContextMutex);
+        if (pObject)  g_pWebSocket = pObject;
+        if (sendFrame) g_sendFrame = sendFrame;
+        if (!g_HdrTemplate.empty() || !pHdr || cbHdr == 0) return;
+
+        CMsgProtoBufHeader candidate;
+        if (!candidate.ParseFromArray(pHdr, static_cast<int>(cbHdr)) ||
+            !candidate.has_steamid() || candidate.steamid() == 0)
+            return;
+
+        g_HdrTemplate.assign(pHdr, pHdr + cbHdr);
+    }
+
+    bool Send(AppId_t appId)
+    {
+        std::vector<uint8> hdrTemplate;
+        void* ws = nullptr;
+        SendFrameFn send = nullptr;
+        uint64 jobId = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_ContextMutex);
+            if (!g_pWebSocket || !g_sendFrame || g_HdrTemplate.empty()) {
+                LOG_NETPACKET_WARN("OwnershipTicketFetch: no send context captured yet");
+                return false;
+            }
+            hdrTemplate = g_HdrTemplate;
+            ws   = g_pWebSocket;
+            send = g_sendFrame;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_Mutex);
+            jobId = ++g_NextJobId;
+        }
+
+        CMsgProtoBufHeader hdr;
+        if (!hdr.ParseFromArray(hdrTemplate.data(), static_cast<int>(hdrTemplate.size()))) {
+            LOG_NETPACKET_WARN("OwnershipTicketFetch: header template failed to parse");
+            return false;
+        }
+        hdr.clear_target_job_name();
+        hdr.set_jobid_source(jobId);
+        hdr.clear_jobid_target();
+
+        // Build varint-encoded body: field 1 (app_id) as varint
+        std::vector<uint8> body;
+        uint32 value = appId;
+        body.push_back(0x08); // field 1, wire type 0 (varint)
+        while (value >= 0x80) {
+            body.push_back(static_cast<uint8>(value) | 0x80);
+            value >>= 7;
+        }
+        body.push_back(static_cast<uint8>(value));
+
+        const uint32 cbHdr2 = static_cast<uint32>(hdr.ByteSizeLong());
+        std::vector<uint8> frame(sizeof(MsgHdr) + cbHdr2 + body.size());
+        auto* mhdr = reinterpret_cast<MsgHdr*>(frame.data());
+        mhdr->eMsg = static_cast<EMsg>(
+            static_cast<uint32>(k_EMsgClientGetAppOwnershipTicket) | kMsgHdrProtoFlag);
+        mhdr->headerLength = cbHdr2;
+
+        if (!hdr.SerializeToArray(frame.data() + sizeof(MsgHdr), static_cast<int>(cbHdr2))) {
+            LOG_NETPACKET_WARN("OwnershipTicketFetch: failed to serialize header");
+            return false;
+        }
+        std::memcpy(frame.data() + sizeof(MsgHdr) + cbHdr2, body.data(), body.size());
+
+        LOG_NETPACKET_INFO("OwnershipTicketFetch send: app={} jobid={} ({} bytes)",
+                           appId, jobId, frame.size());
+        return send(ws, k_eWebSocketOpCode_Binary, frame.data(), static_cast<uint32>(frame.size()));
+    }
+
+    bool Request(AppId_t appId, uint32_t timeoutMs)
+    {
+        if (appId == 0) return false;
+        if (!Hooks_Decryption::GetMemCachedAppOwnershipTicket(appId).empty()) return true;
+        {
+            std::lock_guard<std::mutex> lock(g_Mutex);
+            if (g_Failed.contains(appId)) return false;
+        }
+        if (!Send(appId)) return false;
+
+        const auto ticket = Hooks_Decryption::WaitForCachedTicket(appId, timeoutMs);
+        if (ticket.empty()) {
+            std::lock_guard<std::mutex> lock(g_Mutex);
+            g_Failed.insert(appId);
+            LOG_NETPACKET_WARN("OwnershipTicketFetch: no ticket for app {} within {} ms", appId, timeoutMs);
+            return false;
+        }
+
+        LOG_NETPACKET_INFO("OwnershipTicketFetch: got ticket for app {} ({} bytes)", appId, ticket.size());
+        return true;
+    }
+
+    void Reset() {
+        {
+            std::lock_guard<std::mutex> lock(g_ContextMutex);
+            g_pWebSocket = nullptr;
+            g_sendFrame  = nullptr;
+            g_HdrTemplate.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_Mutex);
+            g_Failed.clear();
+            g_NextJobId = 0x7E52'0000'0000'0000ull;
+        }
+    }
+
+} // namespace Hooks_NetPacket_TicketFetch
+
+// ════════════════════════════════════════════════════════════════
 //  Dispatch
 // ════════════════════════════════════════════════════════════════
 namespace {
@@ -2606,6 +2745,33 @@ namespace {
             return oBBuildAndAsyncSendFrame(pObject, eWebSocketOpCode, pubData, cubData);
         }
 
+        // Capture WebSocket context for originated eMsg 857 ticket requests
+        Hooks_NetPacket_TicketFetch::CaptureContext(
+            pObject, oBBuildAndAsyncSendFrame, nullptr, 0);
+        if (!pkt->hdr.empty()) {
+            Hooks_NetPacket_TicketFetch::CaptureContext(
+                nullptr, nullptr, pkt->hdr.data(), static_cast<uint32>(pkt->hdr.size()));
+
+            // Warm up ticket cache on first authenticated frame
+            CMsgProtoBufHeader loginHdr;
+            if (loginHdr.ParseFromArray(pkt->hdr.data(), static_cast<int>(pkt->hdr.size())) &&
+                loginHdr.has_steamid() && loginHdr.steamid() != 0)
+            {
+                static std::once_flag ticketWarmOnce;
+                std::call_once(ticketWarmOnce, [] {
+                    OSTPlatform::Thread::StartDetached([] {
+                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                        constexpr AppId_t kSteamClientAppId = 7;
+                        if (!Hooks_Decryption::GetCacheAppOwnershipTicket(kSteamClientAppId).empty() ||
+                            !Hooks_Decryption::GetMemCachedAppOwnershipTicket(kSteamClientAppId).empty())
+                            return 0u;
+                        Hooks_NetPacket_TicketFetch::Request(kSteamClientAppId, 4000);
+                        return 0u;
+                    });
+                });
+            }
+        }
+
         std::span<uint8> modifiedFrame{};
         bool replaced = false;
         bool suppress = false;
@@ -2675,6 +2841,10 @@ namespace {
 
 
 namespace Hooks_NetPacket {
+    bool RequestOwnershipTicket(AppId_t appId, uint32_t timeoutMs) {
+        return Hooks_NetPacket_TicketFetch::Request(appId, timeoutMs);
+    }
+
     void Install() {
         g_ShuttingDown.store(false, std::memory_order_release);
         RESOLVE_C(PchMsgNameFromEMsg);
@@ -2731,6 +2901,7 @@ namespace Hooks_NetPacket {
             Hooks_NetPacket_LegacyKey::Clear();
         }
 
+        Hooks_NetPacket_TicketFetch::Reset();
         NetPacketLayout::Reset();
 
         for (int i = 0; i < 50 && Hooks_NetPacket_Manifest::g_ActiveFetchThreads.load(std::memory_order_acquire) != 0; ++i) {
