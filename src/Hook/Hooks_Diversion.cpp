@@ -77,12 +77,11 @@ HMODULE WINAPI Hooked_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD 
                 g_IsDiversionActive.store(true, std::memory_order_release);
                 g_DiversionAdopted.store(true, std::memory_order_release);
 
-                // Startup Race Barrier: Wait for client hooks to be installed before
-                // steam.exe invokes exports on the returned module handle.
-                if (!g_HooksInstalled.load(std::memory_order_acquire) && g_hClientHooksReadyEvent) {
-                    ::WaitForSingleObject(g_hClientHooksReadyEvent, 2000);
-                }
-
+                // ARCHITECTURAL NOTE: Non-blocking LoadLibrary
+                // We intentionally do NOT wait on g_hClientHooksReadyEvent with WaitForSingleObject here.
+                // Blocking Steam's main thread during early module load freezes the Steam UI ("Steam stuck on login").
+                // Instead, steamclient loading synchronization is deferred to SteamUI's LoadModuleWithPath hook
+                // where a cooperative spin-wait safely yields execution.
                 LOG_INFO("Hooks_Diversion: Redirected LoadLibraryExW {} -> {}",
                          OSTPlatform::Encoding::WideToUtf8(lpLibFileName),
                          DiversionPath);
@@ -97,9 +96,7 @@ HMODULE WINAPI Hooked_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD 
         if (hOrig) {
             auto expected = static_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(nullptr);
             client_hModule.compare_exchange_strong(expected, reinterpret_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(hOrig));
-            if (!g_HooksInstalled.load(std::memory_order_acquire) && g_hClientHooksReadyEvent) {
-                ::WaitForSingleObject(g_hClientHooksReadyEvent, 2000);
-            }
+            // Non-blocking fallback: return handle immediately without waiting on g_hClientHooksReadyEvent
         }
         return hOrig;
     }
@@ -127,10 +124,9 @@ HMODULE WINAPI Hooked_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DWORD d
                 g_IsDiversionActive.store(true, std::memory_order_release);
                 g_DiversionAdopted.store(true, std::memory_order_release);
 
-                if (!g_HooksInstalled.load(std::memory_order_acquire) && g_hClientHooksReadyEvent) {
-                    ::WaitForSingleObject(g_hClientHooksReadyEvent, 2000);
-                }
-
+                // ARCHITECTURAL NOTE: Non-blocking LoadLibrary
+                // We intentionally do NOT wait on g_hClientHooksReadyEvent with WaitForSingleObject here.
+                // Main-thread blocking is avoided to prevent Steam login UI freeze.
                 LOG_INFO("Hooks_Diversion: Redirected LoadLibraryExA {} -> {}",
                          lpLibFileName, DiversionPath);
                 return hDiv;
@@ -144,9 +140,7 @@ HMODULE WINAPI Hooked_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DWORD d
         if (hOrig) {
             auto expected = static_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(nullptr);
             client_hModule.compare_exchange_strong(expected, reinterpret_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(hOrig));
-            if (!g_HooksInstalled.load(std::memory_order_acquire) && g_hClientHooksReadyEvent) {
-                ::WaitForSingleObject(g_hClientHooksReadyEvent, 2000);
-            }
+            // Non-blocking fallback: return handle immediately without waiting on g_hClientHooksReadyEvent
         }
         return hOrig;
     }

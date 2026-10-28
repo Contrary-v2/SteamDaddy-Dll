@@ -7,6 +7,11 @@
 // Hooks targeting steamui.dll:
 
 namespace Hooks_SteamUI {
+    /// Installs early diversion hooks (specifically steamui.dll!LoadModuleWithPath)
+    /// right after pattern scans complete and before heavy IPC / ticket initialization.
+    /// This intercepts steamclient loading and performs a cooperative spin-wait, keeping
+    /// Steam's main thread responsive and preventing the "Steam stuck on login" issue.
+    void InstallDiversionHooks();
     void Install();
     void Uninstall();
     void DetachWorkerThreads();

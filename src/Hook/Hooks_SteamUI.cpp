@@ -36,7 +36,74 @@
 
 namespace
 {
+    using namespace std::chrono_literals;
+    constexpr int  kMaxRetry      = 500;
+    constexpr auto kRetryInterval = 10ms;
 
+    static std::string_view ExtractFileName(std::string_view path) {
+        const size_t pos = path.find_last_of("\\/");
+        return (pos == std::string_view::npos) ? path : path.substr(pos + 1);
+    }
+
+    static bool EqualsIgnoreCase(std::string_view a, std::string_view b) noexcept {
+        return (a.size() == b.size()) && (_strnicmp(a.data(), b.data(), a.size()) == 0);
+    }
+
+    static bool IsSteamClientPath(const char* path) {
+        if (!path) return false;
+        const std::string_view fn = ExtractFileName(path);
+        return EqualsIgnoreCase(fn, "steamclient64.dll") ||
+               EqualsIgnoreCase(fn, "steamclient.dll")   ||
+               EqualsIgnoreCase(fn, "steamclient64")     ||
+               EqualsIgnoreCase(fn, "steamclient");
+    }
+
+    // ========================================================================
+    // SteamUI!LoadModuleWithPath Hook
+    // ========================================================================
+    // Intercepts SteamUI's internal loader for steamclient64.dll. Instead of
+    // hard-blocking the main thread in kernel LoadLibrary, this hook implements
+    // cooperative polling (up to 5s with 10ms yields) until background hook
+    // installation (g_HooksInstalled) completes, then safely returns the
+    // redirected diversion module handle.
+    HOOK_FUNC(LoadModuleWithPath, void*, const char* path, bool flags)
+    {
+        const bool isSteamClient = IsSteamClientPath(path);
+
+        if (isSteamClient) {
+            bool logged = false;
+            for (int i = 0; i < kMaxRetry && !g_HooksInstalled.load(std::memory_order_acquire); ++i) {
+                if (!logged) {
+                    LOG_STEAMUI_DEBUG("LoadModuleWithPath: waiting for hooks to be installed...");
+                    logged = true;
+                }
+                std::this_thread::sleep_for(kRetryInterval);
+            }
+        }
+
+        void* h = oLoadModuleWithPath(path, flags);
+
+        if (isSteamClient) {
+            if (!g_HooksInstalled.load(std::memory_order_acquire)) {
+                LOG_STEAMUI_WARN("LoadModuleWithPath: hooks initialization timed out after {} ms, aborting diversion",
+                                 kMaxRetry * static_cast<int>(kRetryInterval.count()));
+                return h;
+            }
+
+            auto mod = client_hModule.load(std::memory_order_acquire);
+            if (mod) {
+                if (g_IsDiversionActive.load(std::memory_order_acquire)) {
+                    LOG_STEAMUI_INFO("LoadModuleWithPath: diverted {} -> diversion module",
+                                     path ? path : "steamclient64.dll");
+                } else {
+                    LOG_STEAMUI_INFO("LoadModuleWithPath: returned fallback steamclient64.dll");
+                }
+                return mod;
+            }
+        }
+
+        return h;
+    }
 
     RESOLVE_FUNC(RepeatedFieldUint32_Add, void, void* field, const uint32* value);
 
@@ -926,6 +993,13 @@ namespace
 
 namespace Hooks_SteamUI
 {
+    void InstallDiversionHooks()
+    {
+        HOOK_BEGIN();
+        INSTALL_HOOK_U(LoadModuleWithPath);
+        HOOK_END();
+    }
+
     void Install()
     {
         ARM_CAPTURE_U(GetAppByID);
@@ -966,6 +1040,7 @@ namespace Hooks_SteamUI
         s_timeSliceCursor = 0;
 
         UNHOOK_BEGIN();
+        UNINSTALL_HOOK(LoadModuleWithPath);
         UNINSTALL_HOOK(FillInAppOverview);
         UNINSTALL_HOOK(BuildCompleteAppOverviewChange);
         UNINSTALL_HOOK(CSteamUIAppControllerRunFrame);

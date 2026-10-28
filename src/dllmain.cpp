@@ -84,17 +84,13 @@ static uint32_t DiversionWatchdog() {
     return 0;
 }
 
-// Prepare key runtime paths.
-// Portable: Steam components (steamclient64.dll, steamui.dll, etc.) are located
-// in Steam's real installation directory, while configuration and Lua scripts can be
-// loaded from the portable DLL directory or fallback to Steam's installation directory.
-static bool InitializeRuntimePaths(OSTPlatform::DynamicLibrary::ModuleHandle selfModule)
+// Phase 1 — DllMain-safe: only GetModuleFileNameW / string ops.
+// No std::filesystem, no file I/O, no CreateDirectory — nothing that can
+// trigger filter drivers or AV scanners under the loader lock.
+static bool InitializeRuntimePathsPhase1(OSTPlatform::DynamicLibrary::ModuleHandle selfModule)
 {
-    using OSTPlatform::Encoding::PathFromUtf8;
     using OSTPlatform::Encoding::PathToUtf8;
 
-    // 1. Locate Steam's actual install directory (where steam.exe and steamclient64.dll reside).
-    // Injected into steam.exe: GetModuleDirectory(nullptr) returns the directory of steam.exe.
     auto steamExeDir = OSTPlatform::DynamicLibrary::GetModuleDirectory(nullptr);
     std::string steamPath = PathToUtf8(steamExeDir);
     if (steamPath.empty()) {
@@ -110,11 +106,9 @@ static bool InitializeRuntimePaths(OSTPlatform::DynamicLibrary::ModuleHandle sel
     if (!FormatPath(SteamInstallPath, "%s", steamPath.c_str()) ||
         !FormatPath(SteamclientPath,  "%s\\steamclient64.dll", SteamInstallPath) ||
         !FormatPath(SteamUIPath,      "%s\\steamui.dll",       SteamInstallPath)) {
-        LOG_ERROR("Steam install path exceeds runtime buffer capacity ({})", kRuntimePathCapacity);
         return false;
     }
 
-    // 2. Locate SteamDaddy DLL directory (portable mode support).
     auto dllDir = OSTPlatform::DynamicLibrary::GetModuleDirectory(selfModule);
     std::string dllPath = PathToUtf8(dllDir);
     if (dllPath.empty()) {
@@ -125,11 +119,24 @@ static bool InitializeRuntimePaths(OSTPlatform::DynamicLibrary::ModuleHandle sel
         dllPath.pop_back();
     }
     if (!FormatPath(DllDir, "%s", dllPath.c_str())) {
-        LOG_ERROR("DLL directory path exceeds runtime buffer capacity ({})", kRuntimePathCapacity);
         return false;
     }
 
-    // Evaluate portable mode once after SteamInstallPath and DllDir are set.
+    if (!FormatPath(DiversionPath, "%s\\bin\\diversion64.dll", SteamInstallPath)) {
+        return false;
+    }
+
+    return true;
+}
+
+// Phase 2 — runs on InitThread (no loader lock).
+// All std::filesystem calls, directory creation, portable-mode detection,
+// and TOML resolution happen here where filter-driver reentrancy is safe.
+static bool InitializeRuntimePathsPhase2()
+{
+    using OSTPlatform::Encoding::PathFromUtf8;
+    using OSTPlatform::Encoding::PathToUtf8;
+
     auto dllFsPath   = PathFromUtf8(DllDir).lexically_normal();
     auto steamFsPath = PathFromUtf8(SteamInstallPath).lexically_normal();
     if (!dllFsPath.has_filename() && dllFsPath != dllFsPath.root_path()) {
@@ -145,14 +152,6 @@ static bool InitializeRuntimePaths(OSTPlatform::DynamicLibrary::ModuleHandle sel
                            (_wcsicmp(dllFsPath.c_str(), (steamFsPath / "bin").c_str()) == 0);
     g_IsPortableMode.store(!inSteamDir, std::memory_order_release);
 
-    if (!FormatPath(DiversionPath, "%s\\bin\\diversion64.dll", SteamInstallPath)) {
-        LOG_ERROR("Diversion path exceeds runtime buffer capacity ({})", kRuntimePathCapacity);
-        return false;
-    }
-
-    // 3. Resolve config and lua directory:
-    // Check DllDir first (portable folder), fallback to SteamInstallPath.
-    // Checks for steamdaddy.toml first, falling back to opensteamtool.toml for backwards compatibility.
     auto resolveToml = [](const std::filesystem::path& dir) -> std::filesystem::path {
         std::error_code ec;
         auto p1 = dir / "steamdaddy.toml";
@@ -249,6 +248,23 @@ static uint32_t InitThread(OSTPlatform::DynamicLibrary::ModuleHandle selfModule)
         Log::Init(selfModule);
         LOG_INFO("SteamDaddy init thread started");
 
+        // Phase 2 path resolution: filesystem I/O deferred from DllMain to avoid
+        // loader-lock deadlocks with AV / cloud-sync filter drivers.
+        if (!InitializeRuntimePathsPhase2()) {
+            LOG_ERROR("InitializeRuntimePathsPhase2 failed");
+            return 1;
+        }
+
+        // Diversion file copy: deferred from DllMain to avoid CopyFileW + AV
+        // scanner deadlocks under the loader lock. The LoadLibrary hooks were
+        // already installed synchronously in DllMain; if Steam calls LoadLibrary
+        // before the copy finishes, the hook falls back to the original DLL.
+        if (!g_steamClientMappedAtAttach.load(std::memory_order_acquire)) {
+            Hooks_Diversion::EnsureDiversionFileReady(
+                OSTPlatform::Encoding::Utf8ToWide(SteamclientPath),
+                OSTPlatform::Encoding::Utf8ToWide(DiversionPath));
+        }
+
         if (!InitializeSteamComponents(selfModule)) {
             LOG_ERROR("InitializeSteamComponents failed");
             return 1;
@@ -308,6 +324,12 @@ static uint32_t InitThread(OSTPlatform::DynamicLibrary::ModuleHandle selfModule)
         // but run on this worker thread, never under the loader lock.
         PatternLoader::Load(ui_hModule, SteamUIPath, "steamui");
         PatternLoader::Load(client_hModule, SteamclientPath, "steamclient");
+
+        // Early UI Diversion Hooks: Immediately install steamui!LoadModuleWithPath hook
+        // after pattern resolution and before IPCLoader / ticket decryption.
+        // This coordinates steamclient loading with cooperative spin-wait, keeping Steam's
+        // main UI thread responsive during login ("Steam stuck on login" fix).
+        HookManager::InstallEarlyUIHooks();
 
         // IPC method metadata (funcHash, fencepost, argc, ...)
         IPCLoader::Load(SteamclientPath);
@@ -384,24 +406,21 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, PVOID pvReserved)
 
         auto selfMod = reinterpret_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(hModule);
 
-        // 1. Resolve key runtime paths early at process load time (0ms)
-        InitializeRuntimePaths(selfMod);
+        // Phase 1 only: string-based path capture (no filesystem I/O under loader lock).
+        // Phase 2 (portable-mode detection, directory creation, TOML resolution) is
+        // deferred to InitThread to avoid deadlocks with AV / filter drivers.
+        InitializeRuntimePathsPhase1(selfMod);
 
-        // Check if steamclient64.dll is already in memory upon attach!
-        // When loaded via xinput1_4.dll or dwmapi.dll (late loader), steamclient64.dll
-        // is ALREADY mapped. Diversion cannot be swapped in, so we bypass diversion
-        // and hook the live steamclient64.dll directly!
+        // Record whether steamclient64.dll is already mapped (late-loader detection).
         const bool steamClientAlreadyMapped = (::GetModuleHandleW(L"steamclient64.dll") != nullptr);
         g_steamClientMappedAtAttach.store(steamClientAlreadyMapped, std::memory_order_release);
 
         if (!steamClientAlreadyMapped)
         {
-            // 2. Synchronize diversion shadow module if needed
-            Hooks_Diversion::EnsureDiversionFileReady(
-                OSTPlatform::Encoding::Utf8ToWide(SteamclientPath),
-                OSTPlatform::Encoding::Utf8ToWide(DiversionPath));
-
-            // 3. Synchronously hook KERNELBASE!LoadLibraryExW at 0ms
+            // Install LoadLibrary/GetModuleHandle hooks synchronously — Detour
+            // memory patching is fast and loader-lock-safe (no I/O).
+            // The heavy file copy (EnsureDiversionFileReady) is deferred to
+            // InitThread to avoid CopyFileW + AV deadlocks under the loader lock.
             Hooks_Diversion::Install();
         }
         else
