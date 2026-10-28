@@ -19,6 +19,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <windows.h>
 
 namespace {
     // SEH crash fuse: if CheckAppOwnership ever crashes, injection is permanently
@@ -457,6 +458,20 @@ namespace {
         return result;
     }
 
+    // SEH wrapper in a POD-only function — no C++ objects, so __try is legal under /EHsc.
+    static bool CheckAppOwnershipSEH(void* pObj, AppId_t appId, AppOwnership* pOwn, bool origResult, bool* crashed) {
+        *crashed = false;
+        bool out = origResult;
+        __try {
+            out = CheckAppOwnershipBody(pObj, appId, pOwn, origResult);
+        } __except (InjectionFilter(GetExceptionInformation())) {
+            g_injectDisabled.store(true, std::memory_order_release);
+            *crashed = true;
+            return origResult;
+        }
+        return out;
+    }
+
     HOOK_FUNC(CheckAppOwnership, bool, void* pObj, AppId_t appId, AppOwnership* pOwn) {
         const auto origCheckAppOwnership = oCheckAppOwnership;
         if (!origCheckAppOwnership) {
@@ -483,14 +498,11 @@ namespace {
         // Fused out — return original result, never touch memory again.
         if (g_injectDisabled.load(std::memory_order_relaxed)) return result;
 
-        bool out = result;
-        __try {
-            out = CheckAppOwnershipBody(pObj, appId, pOwn, result);
-        } __except (InjectionFilter(GetExceptionInformation())) {
-            g_injectDisabled.store(true, std::memory_order_release);
+        bool crashed = false;
+        bool out = CheckAppOwnershipSEH(pObj, appId, pOwn, result, &crashed);
+        if (crashed) {
             LOG_PACKAGE_ERROR("CheckAppOwnership: crashed (code=0x{:X} addr={}), injection disabled for session",
                               g_injectExCode, g_injectExAddr);
-            return result;
         }
         return out;
     }
