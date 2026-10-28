@@ -57,7 +57,7 @@ namespace {
 
     AppId_t ResolvePipeOrOnlineFixAppId(CPipeClient* pipe) {
         AppId_t appId = Hooks_Misc::ResolvePipeAppId();
-        if (appId == 0 && pipe && !pipe->m_bInProcess) {
+        if (appId == 0 && pipe) {
             appId = PipeManager::DenuvoAuth::GetAuthorizedAppId(pipe);
         }
         return appId;
@@ -119,7 +119,7 @@ namespace {
         if (req.cbMaxTicket() < 0 || req.cbMaxTicket() > INT32_MAX - 32) return;
 
         AppId_t appId = req.unAppID() == Hooks_Misc::kOnlineFixAppId ? Hooks_Misc::ResolvePipeAppId() : req.unAppID();
-        if (appId == 0 && pipe && !pipe->m_bInProcess) {
+        if (appId == 0 && pipe) {
             appId = PipeManager::DenuvoAuth::GetAuthorizedAppId(pipe);
         }
         if (appId == 0) return;

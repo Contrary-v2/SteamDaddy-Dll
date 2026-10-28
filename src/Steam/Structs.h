@@ -363,8 +363,7 @@ struct CPipeClient {
     int32    m_nActiveRefs;     // +128
     uint8    _pad3[188];        // +132
     void*    m_pLocalIPCServer; // +320
-    bool     m_bInProcess;      // +328
-    uint8    _pad4[31];         // +329
+    uint8    _pad4[32];         // +328
 
 	std::string DebugString() const {
 		return std::format("pipe=0x{:08X} pid={} proc={} ",
@@ -378,7 +377,6 @@ static_assert(offsetof(CPipeClient, m_clientPID) == 0x20, "m_clientPID offset mi
 static_assert(offsetof(CPipeClient, m_szProcessName) == 0x28, "m_szProcessName offset mismatch");
 static_assert(offsetof(CPipeClient, m_nActiveRefs) == 0x80, "m_nActiveRefs offset mismatch");
 static_assert(offsetof(CPipeClient, m_pLocalIPCServer) == 0x140, "m_pLocalIPCServer offset mismatch");
-static_assert(offsetof(CPipeClient, m_bInProcess) == 0x148, "m_bInProcess offset mismatch");
 static_assert(std::is_standard_layout_v<CPipeClient>, "CPipeClient must be standard layout");
 
 struct CGameID{

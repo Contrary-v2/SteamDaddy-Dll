@@ -148,7 +148,7 @@ namespace {
             if (const auto* handler = FindHandler(call.interfaceID(), call.funcHash())) {
                 if (CPipeClient* pipe = GetPipe(pServer, hSteamPipe)) {
                     AppId_t currentAppId = Hooks_Misc::ResolvePipeAppId();
-                    if (currentAppId == 0 && !pipe->m_bInProcess) {
+                    if (currentAppId == 0 && pipe) {
                         currentAppId = PipeManager::DenuvoAuth::GetAuthorizedAppId(pipe);
                     }
                     if ((currentAppId != 0 && LuaConfig::HasDepot(currentAppId, false)) || Hooks_Misc::IsOnlineFixActive()) {
