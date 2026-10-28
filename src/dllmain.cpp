@@ -17,7 +17,9 @@
 #include "OSTPlatform/include/Thread.h"
 
 #include <cctype>
+#include <chrono>
 #include <cstdio>
+#include <thread>
 #include <windows.h>
 
 template <typename... Args>
@@ -28,6 +30,58 @@ static inline bool FormatPath(char (&dst)[kRuntimePathCapacity], const char* fmt
         return false;
     }
     return true;
+}
+
+// ── Diversion fallback: switch from shadow module back to original steamclient ──
+// clientHooksArmed: whether client hooks are installed on the diversion module.
+// Watchdog scenario: true (must unhook then rehook on original).
+// Init scenario: false (hooks not yet installed).
+static bool FallbackToOriginalSteamClient(bool clientHooksArmed) {
+    if (clientHooksArmed) {
+        HookManager::UninstallClientHooks();
+    }
+    // Bypass all LoadLibrary redirects so future loads use the original.
+    // Never FreeLibrary the diversion: cloud_redirect may hold absolute addresses into it.
+    Hooks_Diversion::SetBypass(true);
+    auto hOrig = OSTPlatform::DynamicLibrary::Load(
+        OSTPlatform::Encoding::PathFromUtf8(SteamclientPath));
+    g_IsDiversionActive.store(false, std::memory_order_release);
+    if (!hOrig) {
+        LOG_ERROR("Diversion fallback: Load steamclient64.dll failed: {} (err={})",
+                  SteamclientPath, OSTPlatform::DynamicLibrary::GetLastErrorCode());
+        return false;
+    }
+    client_hModule.store(hOrig, std::memory_order_release);
+    PatternLoader::Load(hOrig, SteamclientPath, "steamclient");
+    if (clientHooksArmed) {
+        HookManager::InstallClientHooks();
+        PatternLoader::ReportMissingFunctions();
+    }
+    Hooks_Package::RequestRequeryOnce();
+    LOG_WARN("Diversion: fallback complete, hooks now on original steamclient64 — "
+             "unlock keeps working, isolation disabled");
+    return true;
+}
+
+// 15-second safety net: if Steam never adopted the diversion module, fall back.
+// Normal machines adopt within ~1s. Mis-fire only costs isolation (= pre-diversion behavior).
+constexpr auto kDiversionAdoptTimeout = std::chrono::seconds{15};
+constexpr auto kWatchdogSlice = std::chrono::seconds{5};
+
+static uint32_t DiversionWatchdog() {
+    const int slices = static_cast<int>(kDiversionAdoptTimeout / kWatchdogSlice);
+    for (int i = 0; i < slices; ++i) {
+        std::this_thread::sleep_for(kWatchdogSlice);
+        if (!g_HooksInstalled.load(std::memory_order_acquire)) return 0;
+    }
+    if (!g_IsDiversionActive.load(std::memory_order_acquire) ||
+         g_DiversionAdopted.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    LOG_WARN("Diversion: Steam did not adopt diversion module within {}s, falling back to original",
+             static_cast<int>(kDiversionAdoptTimeout.count()));
+    if (!FallbackToOriginalSteamClient(true)) return 1;
+    return 0;
 }
 
 // Prepare key runtime paths.
@@ -292,6 +346,13 @@ static uint32_t InitThread(OSTPlatform::DynamicLibrary::ModuleHandle selfModule)
         g_HooksInstalled.store(true, std::memory_order_release);
         if (Hooks_Diversion::g_hClientHooksReadyEvent) {
             ::SetEvent(Hooks_Diversion::g_hClientHooksReadyEvent);
+        }
+
+        // Diversion watchdog: if Steam never adopted the shadow module, fall back
+        // to hooking the original steamclient64.dll after 15 seconds.
+        if (g_IsDiversionActive.load(std::memory_order_acquire) &&
+            !g_DiversionAdopted.load(std::memory_order_acquire)) {
+            OSTPlatform::Thread::StartDetached([] { return DiversionWatchdog(); });
         }
 
         // Start watchers strictly after all hooks and subsystems are fully ready,
