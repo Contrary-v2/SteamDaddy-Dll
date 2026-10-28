@@ -246,13 +246,24 @@ Result Fetch(const Request& request)
         }
     }
 
-    // 3. Cache miss: poll mirrors in order
+    // 3. Cache miss: poll mirrors in order (capped at 30s total to avoid
+    //    blocking InitThread for minutes on restricted/slow networks).
+    constexpr auto kMirrorCrawlTimeout = std::chrono::seconds{30};
+    const auto crawlStart = std::chrono::steady_clock::now();
+
     const std::vector<std::string> urlTemplates = BuildUrlTemplates();
     OSTPlatform::Http::Result http;
     std::string lastUrl;
     size_t notFoundCount = 0;
 
     for (size_t i = 0; i < urlTemplates.size(); ++i) {
+        if (std::chrono::steady_clock::now() - crawlStart > kMirrorCrawlTimeout) {
+            LOG_WARN("RemoteToml({}/{}): mirror crawl exceeded {}s budget, stopping at mirror {}/{}",
+                     request.channel, request.component,
+                     static_cast<int>(kMirrorCrawlTimeout.count()), i, urlTemplates.size());
+            break;
+        }
+
         lastUrl = ExpandTemplate(urlTemplates[i], request, out.sha256);
         LOG_INFO("RemoteToml({}/{}): downloading {}",
                  request.channel, request.component, lastUrl);
