@@ -9,13 +9,37 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <string_view>
+#include <unordered_map>
 
 namespace {
 
     std::atomic<void*> g_pConfigStoreLocal{nullptr};
+
+    // ── In-memory ticket cache (passively harvested from ConfigStore reads) ──
+    std::mutex              g_TicketMtx;
+    std::condition_variable g_TicketCv;
+    std::unordered_map<AppId_t, std::vector<uint8_t>> g_Tickets;
+    uint64_t g_TicketSteamId = 0;
+
+    void HarvestAppticket(std::string_view name, const char* data, size_t size) {
+        static constexpr std::string_view kPrefix = "apptickets\\";
+        if (!name.starts_with(kPrefix)) return;
+
+        const char* begin = name.data() + kPrefix.size();
+        char* end = nullptr;
+        const unsigned long value = std::strtoul(begin, &end, 10);
+        if (value == 0 || value > UINT32_MAX || !end || *end != '\0') return;
+
+        Hooks_Decryption::CacheAppOwnershipTicket(
+            static_cast<AppId_t>(value), reinterpret_cast<const uint8_t*>(data), size);
+    }
 
     HOOK_FUNC(ConfigStoreGetBinary, int32, void* pObject, EConfigStore eConfigStore, const char* KeyName, char* Key, uint32 KeySize) {
         const auto origGetBinary = oConfigStoreGetBinary;
@@ -67,7 +91,11 @@ namespace {
                 }
             }
         }
-        return origGetBinary(pObject, eConfigStore, KeyName, Key, KeySize);
+        const int32 result = origGetBinary(pObject, eConfigStore, KeyName, Key, KeySize);
+        if (result > 0 && Key && static_cast<uint32>(result) <= KeySize) {
+            HarvestAppticket(name, Key, static_cast<size_t>(result));
+        }
+        return result;
     }
 
     [[nodiscard]] std::vector<uint8_t> ReadConfigStoreLocalBinary(const char* keyName) {
@@ -184,5 +212,54 @@ namespace Hooks_Decryption {
 
         LOG_DECRYPTIONKEY_WARN("GetReliableSourceTicket: no valid baseline ticket found in ConfigStore");
         return {};
+    }
+
+    void CacheAppOwnershipTicket(AppId_t appId, const uint8_t* data, size_t size) {
+        if (!data || appId == 0 || size <= AppTicket::kAppTicketSignatureSize) return;
+
+        std::vector<uint8_t> bytes(data, data + size);
+        uint64_t steamId = 0;
+        if (bytes.size() < AppTicket::kAppTicketSteamIdOffset + sizeof(steamId)) return;
+        std::memcpy(&steamId, bytes.data() + AppTicket::kAppTicketSteamIdOffset, sizeof(steamId));
+        if (steamId == 0) return;
+
+        bool isNew = false;
+        {
+            std::lock_guard<std::mutex> lock(g_TicketMtx);
+            if (g_TicketSteamId != 0 && g_TicketSteamId != steamId) {
+                LOG_DECRYPTIONKEY_INFO("ownership ticket cache flushed: SteamID {:017} -> {:017}",
+                                       g_TicketSteamId, steamId);
+                g_Tickets.clear();
+            }
+            g_TicketSteamId = steamId;
+            isNew = g_Tickets.find(appId) == g_Tickets.end();
+            g_Tickets[appId] = std::move(bytes);
+        }
+        if (isNew) {
+            LOG_DECRYPTIONKEY_INFO("harvested ownership ticket for AppId {} ({} bytes, SteamID {:017})",
+                                   appId, size, steamId);
+        }
+        g_TicketCv.notify_all();
+    }
+
+    std::vector<uint8_t> GetMemCachedAppOwnershipTicket(AppId_t appId) {
+        std::lock_guard<std::mutex> lock(g_TicketMtx);
+        const auto it = g_Tickets.find(appId);
+        return it == g_Tickets.end() ? std::vector<uint8_t>{} : it->second;
+    }
+
+    std::vector<uint8_t> GetAnyMemCachedAppOwnershipTicket() {
+        std::lock_guard<std::mutex> lock(g_TicketMtx);
+        return g_Tickets.empty() ? std::vector<uint8_t>{} : g_Tickets.begin()->second;
+    }
+
+    std::vector<uint8_t> WaitForCachedTicket(AppId_t appId, uint32_t timeoutMs) {
+        std::unique_lock<std::mutex> lock(g_TicketMtx);
+        const bool have = g_TicketCv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [appId] {
+            const auto it = g_Tickets.find(appId);
+            return it != g_Tickets.end() && !it->second.empty();
+        });
+        if (!have) return {};
+        return g_Tickets.at(appId);
     }
 }
