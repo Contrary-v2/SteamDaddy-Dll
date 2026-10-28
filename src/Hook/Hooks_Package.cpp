@@ -21,6 +21,18 @@
 #include <vector>
 
 namespace {
+    // SEH crash fuse: if CheckAppOwnership ever crashes, injection is permanently
+    // disabled for this session. Steam stays alive, unlock just stops working.
+    std::atomic<bool> g_injectDisabled{false};
+    static DWORD g_injectExCode = 0;
+    static void* g_injectExAddr = nullptr;
+
+    static LONG WINAPI InjectionFilter(EXCEPTION_POINTERS* ep) {
+        g_injectExCode = ep->ExceptionRecord->ExceptionCode;
+        g_injectExAddr = ep->ExceptionRecord->ExceptionAddress;
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+
     // ── Trivially destructible wrapper for process-lifetime globals ──
     // Prevents CRT atexit static destruction crashes during ExitProcess
     // when secondary threads are terminated mid-operation by the OS.
@@ -389,34 +401,15 @@ namespace {
         }
     }
 
-    HOOK_FUNC(CheckAppOwnership, bool, void* pObj, AppId_t appId, AppOwnership* pOwn) {
-        const auto origCheckAppOwnership = oCheckAppOwnership;
-        if (!origCheckAppOwnership) {
-            return false;
-        }
-
-        void* currentCUser = g_pCUser.load(std::memory_order_acquire);
-        if (pObj && currentCUser != pObj) {
-            void* prevCUser = g_pCUser.exchange(pObj, std::memory_order_acq_rel);
-            if (prevCUser != pObj) {
-                LOG_PACKAGE_DEBUG("CheckAppOwnership: captured CUser {}", pObj);
-                if (prevCUser != nullptr) {
-                    Hooks_Misc::SetActiveAccountID(0);
-                    LuaConfig::ClearOwned();
-                    std::unique_lock wlock(g_sharedLicensesMutex);
-                    g_sharedLicenses->clear();
-                    g_hasSharedLicenses.store(false, std::memory_order_release);
-                }
-            }
-        }
-
+    // Core ownership injection logic, called under SEH protection.
+    // Only POD locals — no C++ objects — so __try is legal (/EHsc).
+    static bool CheckAppOwnershipBody(void* /*pObj*/, AppId_t appId, AppOwnership* pOwn, bool origResult) {
         AppOwnership localOwn{};
         AppOwnership* pEffectiveOwn = pOwn ? pOwn : &localOwn;
 
-        bool result = origCheckAppOwnership(pObj, appId, pEffectiveOwn);
+        bool result = origResult;
         TryInitFakeLicenseOnce();
 
-        // Late-hook bootstrapping latch: force a license re-query once captured CUser is ready
         if (!g_licenseInitialized.load(std::memory_order_acquire) && g_forceRequeryOnce.exchange(false, std::memory_order_acq_rel)) {
             LOG_PACKAGE_INFO("CheckAppOwnership: priming license re-query after late hook install");
             MarkLicenseAsChangedAndProcessUpdates();
@@ -441,16 +434,13 @@ namespace {
             if (!pOwn) {
                 return true;
             }
-            // Principle 1: If official legitimate license is granted (either TrulyOwned or Shared):
-            // The underlying infrastructure 100% preserves official native credentials with zero-intervention pass-through!
             if (hasValidLicense) {
                 pOwn->ReleaseState = EAppReleaseState::Released;
                 return result;
             }
-            // Principle 2: Pure OST assets (neither owned nor shared), assign virtual fake Package 0
             pOwn->PackageId         = kInjectedPackageId;
             pOwn->ReleaseState      = EAppReleaseState::Released;
-            pOwn->bOwnsLicense      = true; // This forces DLCs on steam family shared games that u dont own when adding their appid via .lua
+            pOwn->bOwnsLicense      = true;
             pOwn->bFreeLicense      = false;
             pOwn->bFamilyShared     = false;
             pOwn->bBorrowed         = false;
@@ -460,12 +450,49 @@ namespace {
             return true;
         }
 
-        // App is not active in LuaConfig: native pass-through
         if (!result && pOwn) {
             pOwn->bOwnsLicense = false;
         }
 
         return result;
+    }
+
+    HOOK_FUNC(CheckAppOwnership, bool, void* pObj, AppId_t appId, AppOwnership* pOwn) {
+        const auto origCheckAppOwnership = oCheckAppOwnership;
+        if (!origCheckAppOwnership) {
+            return false;
+        }
+
+        void* currentCUser = g_pCUser.load(std::memory_order_acquire);
+        if (pObj && currentCUser != pObj) {
+            void* prevCUser = g_pCUser.exchange(pObj, std::memory_order_acq_rel);
+            if (prevCUser != pObj) {
+                LOG_PACKAGE_DEBUG("CheckAppOwnership: captured CUser {}", pObj);
+                if (prevCUser != nullptr) {
+                    Hooks_Misc::SetActiveAccountID(0);
+                    LuaConfig::ClearOwned();
+                    std::unique_lock wlock(g_sharedLicensesMutex);
+                    g_sharedLicenses->clear();
+                    g_hasSharedLicenses.store(false, std::memory_order_release);
+                }
+            }
+        }
+
+        bool result = origCheckAppOwnership(pObj, appId, pOwn);
+
+        // Fused out — return original result, never touch memory again.
+        if (g_injectDisabled.load(std::memory_order_relaxed)) return result;
+
+        bool out = result;
+        __try {
+            out = CheckAppOwnershipBody(pObj, appId, pOwn, result);
+        } __except (InjectionFilter(GetExceptionInformation())) {
+            g_injectDisabled.store(true, std::memory_order_release);
+            LOG_PACKAGE_ERROR("CheckAppOwnership: crashed (code=0x{:X} addr={}), injection disabled for session",
+                              g_injectExCode, g_injectExAddr);
+            return result;
+        }
+        return out;
     }
 
     static LicenseClassification ClassifyAppLicense(AppId_t appId) {
@@ -516,6 +543,10 @@ namespace Hooks_Package {
 
 
     void NotifyLicenseChanged() {
+        if (g_injectDisabled.load(std::memory_order_relaxed)) {
+            LOG_PACKAGE_WARN("NotifyLicenseChanged: injection disabled after crash, skipping");
+            return;
+        }
 
         PackageInfo* pPkg = g_pInjectedPackageInfo.load(std::memory_order_acquire);
         if (!pPkg) {
