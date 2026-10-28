@@ -20,4 +20,8 @@ namespace Hooks_Diversion {
 
     // Returns whether the detour is currently active.
     [[nodiscard]] bool IsInstalled() noexcept;
+
+    // Permanently bypass all redirects (pass-through to original).
+    // Used by FallbackToOriginalSteamClient after switching away from diversion.
+    void SetBypass(bool bypass) noexcept;
 }

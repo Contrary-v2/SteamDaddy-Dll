@@ -33,6 +33,7 @@ GetModuleHandleExW_t s_origGetModuleHandleExW = nullptr;
 GetModuleHandleExA_t s_origGetModuleHandleExA = nullptr;
 
 std::atomic<bool> s_isInstalled{false};
+std::atomic<bool> s_bypass{false};
 std::wstring s_wideDiversionPath;
 
 [[nodiscard]] inline bool IsSteamClientModuleW(std::wstring_view path) noexcept {
@@ -65,7 +66,8 @@ std::wstring s_wideDiversionPath;
 
 HMODULE WINAPI Hooked_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags) {
     constexpr DWORD kDataFlags = LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE;
-    if (!hFile && !(dwFlags & kDataFlags) && lpLibFileName && IsSteamClientModuleW(lpLibFileName)) {
+    if (!s_bypass.load(std::memory_order_relaxed) &&
+        !hFile && !(dwFlags & kDataFlags) && lpLibFileName && IsSteamClientModuleW(lpLibFileName)) {
         if (!s_wideDiversionPath.empty()) {
             HMODULE hDiv = s_origLoadLibraryExW ? s_origLoadLibraryExW(s_wideDiversionPath.c_str(), hFile, dwFlags)
                                                 : ::LoadLibraryExW(s_wideDiversionPath.c_str(), hFile, dwFlags);
@@ -73,6 +75,7 @@ HMODULE WINAPI Hooked_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD 
                 auto expected = static_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(nullptr);
                 client_hModule.compare_exchange_strong(expected, reinterpret_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(hDiv));
                 g_IsDiversionActive.store(true, std::memory_order_release);
+                g_DiversionAdopted.store(true, std::memory_order_release);
 
                 // Startup Race Barrier: Wait for client hooks to be installed before
                 // steam.exe invokes exports on the returned module handle.
@@ -113,7 +116,8 @@ HMODULE WINAPI Hooked_LoadLibraryW(LPCWSTR lpLibFileName) {
 
 HMODULE WINAPI Hooked_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DWORD dwFlags) {
     constexpr DWORD kDataFlags = LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE;
-    if (!hFile && !(dwFlags & kDataFlags) && lpLibFileName && IsSteamClientModuleA(lpLibFileName)) {
+    if (!s_bypass.load(std::memory_order_relaxed) &&
+        !hFile && !(dwFlags & kDataFlags) && lpLibFileName && IsSteamClientModuleA(lpLibFileName)) {
         if (!s_wideDiversionPath.empty()) {
             HMODULE hDiv = s_origLoadLibraryExW ? s_origLoadLibraryExW(s_wideDiversionPath.c_str(), hFile, dwFlags)
                                                 : ::LoadLibraryExW(s_wideDiversionPath.c_str(), hFile, dwFlags);
@@ -121,6 +125,7 @@ HMODULE WINAPI Hooked_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DWORD d
                 auto expected = static_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(nullptr);
                 client_hModule.compare_exchange_strong(expected, reinterpret_cast<OSTPlatform::DynamicLibrary::ModuleHandle>(hDiv));
                 g_IsDiversionActive.store(true, std::memory_order_release);
+                g_DiversionAdopted.store(true, std::memory_order_release);
 
                 if (!g_HooksInstalled.load(std::memory_order_acquire) && g_hClientHooksReadyEvent) {
                     ::WaitForSingleObject(g_hClientHooksReadyEvent, 2000);
@@ -427,6 +432,10 @@ void Uninstall() noexcept {
 
 bool IsInstalled() noexcept {
     return s_isInstalled.load(std::memory_order_acquire);
+}
+
+void SetBypass(bool bypass) noexcept {
+    s_bypass.store(bypass, std::memory_order_release);
 }
 
 } // namespace Hooks_Diversion
