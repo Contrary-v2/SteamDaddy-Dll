@@ -43,13 +43,7 @@ else()
     set(STEAMDADDY_VERSION "${STEAMDADDY_VERSION}" CACHE STRING "Version string embedded into SteamDaddy.dll" FORCE)
 endif()
 
-set(OPENSTEAMTOOL_VERSION "${STEAMDADDY_VERSION}")
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
-configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/OpenSteamToolBuildInfo.h.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/generated/OpenSteamToolBuildInfo.h"
-    @ONLY
-)
 
 # Allow CMAKE_MSVC_RUNTIME_LIBRARY to control runtime selection for all targets,
 # including dependencies pulled in via FetchContent.
@@ -100,7 +94,6 @@ endif()
 
 
 
-file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/SteamDaddyBuildInfo.h.in"
     "${CMAKE_CURRENT_BINARY_DIR}/generated/SteamDaddyBuildInfo.h"
@@ -199,7 +192,7 @@ add_subdirectory(OSTPlatform)
 # SteamDaddy — the hook DLL injected into Steam (always 64-bit).
 add_library(SteamDaddy SHARED
     dllmain.cpp
-    OpenSteamTool.rc
+    SteamDaddy.rc
 
     # Shared utilities
     Utils/Tickets/AppTicket.cpp

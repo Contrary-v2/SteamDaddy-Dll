@@ -12,7 +12,7 @@
 #include "I18n.h"
 #include "IfeoEngine.h"
 #include "InjectorEngine.h"
-#include "OpenSteamToolBuildInfo.h"
+#include "SteamDaddyBuildInfo.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
