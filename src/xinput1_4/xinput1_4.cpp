@@ -1,4 +1,4 @@
-// xinput1_4.dll HiJack Project - Dynamic System Wrapper using ProxyBootstrap
+// xinput1_4.dll HiJack Project - Dynamic System Wrapper (Parity with GOAT OST 1.5.3.8)
 #include <windows.h>
 #include <atomic>
 #include <mutex>

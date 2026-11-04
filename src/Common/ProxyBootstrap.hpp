@@ -107,6 +107,24 @@ public:
 
         const size_t exeDirLen = (lastSlash != std::wstring_view::npos) ? (lastSlash + 1) : 0;
 
+        // Guard: only inject when the payload DLL sits beside the host executable.
+        // Absent payload → proxy loads normally but does not inject (mirrors OST 13430f1).
+        if (exeDirLen > 0) {
+            const auto sl = payloadDll.find_last_of(L"\\/");
+            const std::wstring_view dllName = (sl != std::wstring_view::npos) ? payloadDll.substr(sl + 1) : payloadDll;
+            if (!dllName.empty() && dllName.size() < kPathBufCapacity - exeDirLen) {
+                wchar_t guardPath[kPathBufCapacity];
+                std::char_traits<wchar_t>::copy(guardPath, exePathBuf, exeDirLen);
+                std::char_traits<wchar_t>::copy(guardPath + exeDirLen, dllName.data(), dllName.size());
+                guardPath[exeDirLen + dllName.size()] = L'\0';
+                const DWORD attrs = ::GetFileAttributesW(guardPath);
+                const bool present = (attrs != INVALID_FILE_ATTRIBUTES) && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+                ::SecureZeroMemory(guardPath, (exeDirLen + dllName.size() + 1) * sizeof(wchar_t));
+                if (!present)
+                    return TRUE;
+            }
+        }
+
         // Host is verified: inject payload DLL.
         // 1. Idempotency Guard: Extract the base module name and check if it is already
         // loaded in this process (e.g. injected by a coexisting proxy loader like version.dll

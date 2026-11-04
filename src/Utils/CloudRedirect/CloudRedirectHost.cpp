@@ -38,6 +38,10 @@ namespace {
     using CR_GetAchievements_t    = uint32_t (*)(uint32_t, CloudRedirectHost::AchievementBlock*, uint32_t);
     using CR_GetPlaytime_t        = bool (*)(uint32_t, CloudRedirectHost::PlaytimeInfo*);
     using CR_InstallVtableHooks_t = bool (*)();
+    // CR 2.6.9+: signals that a SteamTools-compatible host is present.
+    // Must be called BEFORE CR_InitCloudSave to enable stats/Lua sync
+    // and to prevent CR's unwanted auto_update_dll self-replacement.
+    using CR_SetSteamToolsPresent_t = void (*)(bool);
 
     std::mutex            g_mutex;
     std::atomic<bool>     g_active{false};
@@ -82,6 +86,7 @@ namespace {
     CR_GetAchievements_t    g_getAchievements    = nullptr;
     CR_GetPlaytime_t        g_getPlaytime        = nullptr;
     CR_InstallVtableHooks_t g_installVtableHooks = nullptr;
+    CR_SetSteamToolsPresent_t g_setSteamToolsPresent = nullptr;
 
     std::atomic<OnlineFixAppResolver> g_onlineFixResolver{nullptr};
     std::atomic<LicenseChecker> g_licenseChecker{nullptr};
@@ -206,6 +211,19 @@ void Initialize(const char* steamInstallPath) {
     ResolveSymbol(g_module, "CR_GetAchievements",    g_getAchievements);
     ResolveSymbol(g_module, "CR_GetPlaytime",        g_getPlaytime);
     ResolveSymbol(g_module, "CR_InstallVtableHooks", g_installVtableHooks);
+    ResolveSymbol(g_module, "CR_SetSteamToolsPresent", g_setSteamToolsPresent);
+
+    // Signal to CloudRedirect that a SteamTools-compatible host is present.
+    // This MUST happen before CR_InitCloudSave so that:
+    //   1. Stats/Lua/playtime sync gates (MetadataSync::StGateOpen) open.
+    //   2. auto_update_dll defaults to false (prevents CR self-replacing DLL).
+    if (g_setSteamToolsPresent) {
+        g_setSteamToolsPresent(true);
+        LOG_INFO("CloudRedirect: signalled steamToolsPresent=true");
+    } else {
+        LOG_WARN("CloudRedirect: CR_SetSteamToolsPresent not found in cloud_redirect.dll "
+                 "-- stats/Lua sync disabled; rebuild cloud_redirect.dll from CR 2.6.9+ source");
+    }
 
     try {
         if (!g_initCloudSave(steamInstallPath, &CloudNotify)) {
@@ -565,6 +583,7 @@ void Shutdown() {
     g_getAchievements    = nullptr;
     g_getPlaytime        = nullptr;
     g_installVtableHooks = nullptr;
+    g_setSteamToolsPresent = nullptr;
     LOG_INFO("CloudRedirect: shut down");
 }
 
