@@ -99,7 +99,7 @@ Extracts `AppTicket`, `ETicket`, DLC lists, depot keys, manifests, and auto-gene
 * **Achievement & Stat Tracking**: Enables statistics and achievements for unlocked unowned games.
 * **Resolution Priority**:
   1. Lua Override: `setStat(appid, "steamid")`
-  2. Live Upstream API: `https://stats.opensteamtool.com/{appid}` (queried automatically when `[stats] enable_api = true`)
+  2. Live Upstream API: `https://stats.luastools.xyz/{appid}` (queried automatically when `[stats] enable_api = true`)
   3. Default Preset SteamID: `76561198028121353`
 
 ### Cloud Save Redirection (CloudRedirect)

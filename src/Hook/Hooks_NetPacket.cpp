@@ -567,18 +567,17 @@ namespace Hooks_NetPacket_UserStats {
             }
         }
 
-        // When sha_schema is present, the client already has the schema definitions cached locally.
-        // DO NOT spoof steamid! Spoofing steamid causes Valve to return AccessDenied with an empty body,
-        // which strips the schema and causes achievements to disappear entirely in the UI.
+        // Spoof the stat SteamID even when sha_schema is present, leaving the sha
+        // on the request. The server then returns a fresh schema whenever its hash
+        // differs from the client's, so lua games pick up newly added achievements
+        // instead of keeping their first-downloaded schema forever. The reply path is
+        // handled in HandleRecv_GetUserStatsResponse (eresult=OK, stats stripped,
+        // schema kept / restored from pending), so local stats are unaffected.
         if (hasShaSchema) {
-            if (isOnlineFix) {
-                return CommitSendPacket(pkt, req, outFrame);
-            }
-            LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: sha_schema is present, preserve client request");
-            return false;
+            LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: appid={} sha_schema present, spoofing anyway for schema refresh", appId);
         }
 
-        // First time retrieval without sha_schema: borrow donor steamid to fetch full schema from Valve
+        // Borrow donor steamid to fetch full / updated schema from Valve
         const uint64_t newSteamId = LuaConfig::GetStatSteamId(appId);
         if (newSteamId != 0) {
             req.set_steamid(newSteamId);

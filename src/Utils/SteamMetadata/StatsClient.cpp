@@ -74,17 +74,29 @@ namespace {
             return false;
         }
 
-        char url[128];
-        std::snprintf(url, sizeof(url), "https://stats.opensteamtool.com/%u", appId);
+        constexpr const char* kStatsEndpoints[] = {
+            "https://stats.luastools.xyz/%u",
+            "https://stats.opensteamtool.com/%u"
+        };
 
-        auto r = OSTPlatform::Http::Execute(
-            L"GET", url, nullptr, 0, nullptr,
-            kResolveMs, kConnectMs, kSendMs, kRecvMs);
-        LOG_ACHIEVEMENT_INFO("Stats SteamID API status={} appid={}", r.status, appId);
+        OSTPlatform::Http::Result r{};
+        for (const char* endpoint : kStatsEndpoints) {
+            char url[128];
+            std::snprintf(url, sizeof(url), endpoint, appId);
+
+            r = OSTPlatform::Http::Execute(
+                L"GET", url, nullptr, 0, nullptr,
+                kResolveMs, kConnectMs, kSendMs, kRecvMs);
+            LOG_ACHIEVEMENT_INFO("Stats SteamID API status={} appid={} endpoint={}", r.status, appId, url);
+
+            if (r.ok && r.status == 200) {
+                break;
+            }
+        }
 
         const auto now = std::chrono::steady_clock::now();
         if (!r.ok || r.status != 200) {
-            LOG_ACHIEVEMENT_WARN("Stats SteamID API failed appid={} status={} ok={}", appId, r.status, r.ok);
+            LOG_ACHIEVEMENT_WARN("Stats SteamID API failed all endpoints for appid={} status={} ok={}", appId, r.status, r.ok);
             std::unique_lock<std::shared_mutex> lock(g_mutex);
             g_inFlight.erase(appId);
             EvictExpiredFailures(now);
