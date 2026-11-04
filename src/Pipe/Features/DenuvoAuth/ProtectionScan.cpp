@@ -275,6 +275,7 @@ namespace {
     std::optional<DetectionMatch> TryProtectedBlobSection(
         const ModuleCandidate& module,
         const OSTPlatform::PE::Image& image) {
+        const bool hasLegacySection = FindLegacyDenuvoSection(image) != nullptr;
         for (const auto& section : image.Sections()) {
             // The durable signal: a section that is BOTH writable and
             // executable. This header flag is identical on disk and in the
@@ -296,8 +297,9 @@ namespace {
             if (sample.empty()) continue;
 
             const double entropy = SectionEntropy(sample);
-            if (entropy < kProtectorBlobMinEntropy) {
-                LOG_PIPE_DEBUG("DenuvoAuth: RWX section below entropy floor path={} section={} raw_size={} ({:.2f} MB) entropy={:.3f}",
+            const bool highEntropy = entropy >= kProtectorBlobMinEntropy;
+            if (!highEntropy && !hasLegacySection) {
+                LOG_PIPE_DEBUG("DenuvoAuth: RWX section below entropy floor without legacy section path={} section={} raw_size={} ({:.2f} MB) entropy={:.3f}",
                                module.path, section.name, section.rawSize,
                                BytesToMiB(static_cast<uint64>(section.rawSize)), entropy);
                 continue;
@@ -310,7 +312,7 @@ namespace {
             match.matchRawOffset = section.rawOffset;
             match.matchRva = section.virtualAddress;
             const char* confidence =
-                entropy >= kProtectorBlobHighConfidenceEntropy ? "high(encrypted)" : "elevated";
+                highEntropy ? (entropy >= kProtectorBlobHighConfidenceEntropy ? "high(encrypted)" : "elevated") : "legacy-section";
             LOG_PIPE_INFO("DenuvoAuth: protector blob section path={} section={} raw_size={} ({:.2f} MB) entropy={:.3f} flags=RWX confidence={}",
                           module.path, section.name, section.rawSize,
                           BytesToMiB(static_cast<uint64>(section.rawSize)), entropy, confidence);

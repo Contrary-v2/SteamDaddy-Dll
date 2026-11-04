@@ -1,13 +1,19 @@
 #include "AppTicket.h"
 #include "OSTPlatform/include/SteamCredentialStore.h"
 #include "Utils/Config/LuaConfig.h"
+#include "dllmain.h"
 #include <windows.h>
 #include "Utils/Logging/Log.h"
 
 #include <atomic>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 
 namespace AppTicket {
@@ -24,11 +30,134 @@ namespace AppTicket {
             return head != 0;
         }
 
-        enum class DonorKind { None, Memory, Registry };
+        // 票里 SteamID 的低 32 位就是账号 ID，用它认出这张票是谁的。
+        // 布局与 GetSpoofSteamID 一致：[Size][Version][SteamID]。
+        static uint32_t DonorAccountId(const std::vector<uint8_t>& t) {
+            if (t.size() < kSteamIdTicketMinimumSize) return 0;
+            uint64_t steamId = 0;
+            memcpy(&steamId, t.data() + 8, sizeof(steamId));
+            return static_cast<uint32_t>(steamId & 0xFFFFFFFFull);
+        }
+
+        // 当前登录账号。拿不到时返回 0，调用方据此退回纯结构校验。
+        // 切号必然重启 Steam，进程内不会有第二个值，不需要缓存失效逻辑。
+        static uint32_t ActiveAccountId() {
+            uint32_t accountId = 0;
+            std::wstring universe;
+            if (OSTPlatform::SteamCredentialStore::GetActiveUser(accountId, universe) !=
+                OSTPlatform::SteamCredentialStore::Status::Ok) {
+                return 0;
+            }
+            return accountId;
+        }
+
+        enum class DonorKind { None, Memory, Registry, LocalConfig };
         static DonorKind g_donorKind = DonorKind::None;
         static AppId_t g_donorAppId = 0;
 
-        static bool ReadDonor(DonorKind kind, AppId_t donorAppId, std::vector<uint8_t>& out) {
+        static bool ParseLocalConfigAppTickets(const std::string& data, uint32_t wantAccount,
+                                               AppId_t excludeAppId,
+                                               std::vector<uint8_t>& out, AppId_t& appId) {
+            const size_t marker = data.find("\"apptickets\"");
+            if (marker == std::string::npos) return false;
+
+            const size_t open = data.find('{', marker);
+            if (open == std::string::npos) return false;
+
+            size_t close = std::string::npos;
+            int depth = 0;
+            for (size_t i = open; i < data.size(); ++i) {
+                if (data[i] == '{') {
+                    ++depth;
+                } else if (data[i] == '}') {
+                    if (--depth == 0) { close = i; break; }
+                }
+            }
+            if (close == std::string::npos) return false;
+
+            size_t pos = open;
+            auto NextQuoted = [&](std::string& value) -> bool {
+                const size_t a = data.find('"', pos);
+                if (a == std::string::npos || a >= close) return false;
+                const size_t b = data.find('"', a + 1);
+                if (b == std::string::npos || b >= close) return false;
+                value.assign(data, a + 1, b - a - 1);
+                pos = b + 1;
+                return true;
+            };
+            auto HexNibble = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                return c - 'A' + 10;
+            };
+
+            std::string key;
+            std::string hex;
+            while (NextQuoted(key) && NextQuoted(hex)) {
+                if (key.empty() || key.find_first_not_of("0123456789") != std::string::npos) continue;
+                if (hex.size() < 2 || (hex.size() % 2) != 0) continue;
+
+                bool allHex = true;
+                for (char c : hex) {
+                    if (!std::isxdigit(static_cast<unsigned char>(c))) { allHex = false; break; }
+                }
+                if (!allHex) continue;
+                if (hex.size() / 2 <= kAppTicketSignatureSize) continue;
+
+                std::vector<uint8_t> bytes;
+                bytes.reserve(hex.size() / 2);
+                for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+                    bytes.push_back(static_cast<uint8_t>((HexNibble(hex[i]) << 4) | HexNibble(hex[i + 1])));
+                }
+                if (!IsUsableDonor(bytes)) continue;
+
+                const AppId_t parsedApp = static_cast<AppId_t>(strtoul(key.c_str(), nullptr, 10));
+                if (parsedApp == excludeAppId) continue;
+                if (wantAccount != 0) {
+                    const uint32_t ticketAccount = DonorAccountId(bytes);
+                    if (ticketAccount != 0 && ticketAccount != wantAccount) {
+                        LOG_DEBUG("LocalConfigDonor: skip appid {} base (account {} != {})",
+                                  parsedApp, ticketAccount, wantAccount);
+                        continue;
+                    }
+                }
+
+                out = std::move(bytes);
+                appId = parsedApp;
+                return true;
+            }
+            return false;
+        }
+
+        static bool ReadLocalConfigDonor(uint32_t accountId, AppId_t excludeAppId,
+                                         std::vector<uint8_t>& out, AppId_t& appId) {
+            out.clear();
+            appId = 0;
+            if (accountId == 0 || SteamInstallPath[0] == '\0') return false;
+
+            const std::string path = std::string(SteamInstallPath) + "\\userdata\\" +
+                                     std::to_string(accountId) + "\\config\\localconfig.vdf";
+            std::ifstream file(path, std::ios::binary);
+            if (!file) {
+                LOG_DEBUG("LocalConfigDonor: cannot open {}", path);
+                return false;
+            }
+
+            const std::string data((std::istreambuf_iterator<char>(file)),
+                                    std::istreambuf_iterator<char>());
+            if (data.empty()) return false;
+
+            if (!ParseLocalConfigAppTickets(data, accountId, excludeAppId, out, appId)) {
+                LOG_DEBUG("LocalConfigDonor: no usable ticket in {} ({} bytes)", path, data.size());
+                return false;
+            }
+            LOG_DEBUG("LocalConfigDonor: picked appid {} ({} bytes) from account {}",
+                      appId, out.size(), accountId);
+            return true;
+        }
+
+        static bool ReadDonor(DonorKind kind, AppId_t donorAppId, AppId_t excludeAppId,
+                              std::vector<uint8_t>& out) {
             out.clear();
             if (donorAppId == 0) return false;
             if (kind == DonorKind::Memory) {
@@ -40,53 +169,118 @@ namespace AppTicket {
                     OSTPlatform::SteamCredentialStore::Status::Ok) {
                     out = std::move(t);
                 }
+            } else if (kind == DonorKind::LocalConfig) {
+                std::vector<uint8_t> t;
+                AppId_t appId = 0;
+                if (!ReadLocalConfigDonor(ActiveAccountId(), excludeAppId, t, appId)) return false;
+                if (appId != donorAppId) return false;
+                out = std::move(t);
             }
             return IsUsableDonor(out);
         }
 
         static bool FindDonorAppTicket(AppId_t excludeAppId, std::vector<uint8_t>& out, AppId_t& donorAppId) {
-            out.clear();
-            donorAppId = 0;
-            if (g_donorKind != DonorKind::None && g_donorAppId != excludeAppId) {
-                if (ReadDonor(g_donorKind, g_donorAppId, out)) {
-                    donorAppId = g_donorAppId;
-                    return true;
+            const uint32_t activeAccount = ActiveAccountId();
+
+            auto TryAccept = [&](DonorKind kind, AppId_t cand) -> bool {
+                std::vector<uint8_t> ticket;
+                if (!ReadDonor(kind, cand, excludeAppId, ticket)) return false;
+                if (activeAccount != 0) {
+                    const uint32_t donorAccount = DonorAccountId(ticket);
+                    if (donorAccount != 0 && donorAccount != activeAccount) return false;
                 }
+                out = std::move(ticket);
+                donorAppId = cand;
+                return true;
+            };
+
+            if (g_donorKind != DonorKind::None && g_donorAppId != excludeAppId) {
+                if (TryAccept(g_donorKind, g_donorAppId)) return true;
                 g_donorKind = DonorKind::None;
                 g_donorAppId = 0;
             }
-            const AppId_t memCandidates[] = { kLocalAppTicketSourceAppId, kSysVerifyAppId };
-            for (AppId_t cand : memCandidates) {
-                if (cand == excludeAppId) continue;
-                if (ReadDonor(DonorKind::Memory, cand, out)) {
+
+            auto TryMemCandidates = [&](bool requireOwn) -> bool {
+                const AppId_t memCandidates[] = { kLocalAppTicketSourceAppId, kSysVerifyAppId };
+                for (AppId_t cand : memCandidates) {
+                    if (cand == excludeAppId) continue;
+                    if (!requireOwn) {
+                        if (TryAccept(DonorKind::Memory, cand)) {
+                            g_donorKind = DonorKind::Memory;
+                            g_donorAppId = cand;
+                            LOG_INFO("ForgeLocalAppOwnershipTicket: forge donor from memory appid={} ({} bytes, own_ticket={})",
+                                     cand, out.size(), activeAccount != 0 && DonorAccountId(out) == activeAccount);
+                            return true;
+                        }
+                        continue;
+                    }
+                    std::vector<uint8_t> ticket;
+                    if (!ReadDonor(DonorKind::Memory, cand, excludeAppId, ticket)) continue;
+                    if (activeAccount == 0 || DonorAccountId(ticket) != activeAccount) continue;
+                    out = std::move(ticket);
+                    donorAppId = cand;
                     g_donorKind = DonorKind::Memory;
                     g_donorAppId = cand;
-                    donorAppId = cand;
+                    LOG_INFO("ForgeLocalAppOwnershipTicket: forge donor from memory appid={} ({} bytes, own_ticket=true)",
+                             cand, out.size());
                     return true;
                 }
-            }
-            HKEY hApps = nullptr;
-            if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegAppsPath, 0, KEY_ENUMERATE_SUB_KEYS, &hApps) != ERROR_SUCCESS) {
                 return false;
-            }
-            wchar_t nameBuf[32];
-            for (DWORD index = 0; ; ++index) {
-                DWORD nameLen = static_cast<DWORD>(std::size(nameBuf));
-                if (RegEnumKeyExW(hApps, index, nameBuf, &nameLen, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
-                    break;
+            };
+
+            auto TryLocalConfig = [&]() -> bool {
+                if (activeAccount == 0) return false;
+                std::vector<uint8_t> ticket;
+                AppId_t cand = 0;
+                if (!ReadLocalConfigDonor(activeAccount, excludeAppId, ticket, cand)) return false;
+                out = std::move(ticket);
+                donorAppId = cand;
+                g_donorKind = DonorKind::LocalConfig;
+                g_donorAppId = cand;
+                LOG_INFO("ForgeLocalAppOwnershipTicket: forge donor from localconfig appid={} ({} bytes, account={})",
+                         cand, out.size(), activeAccount);
+                return true;
+            };
+
+            auto TryRegistry = [&](bool requireOwn) -> bool {
+                HKEY hApps = nullptr;
+                if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegAppsPath, 0, KEY_ENUMERATE_SUB_KEYS,
+                                  &hApps) != ERROR_SUCCESS) {
+                    return false;
                 }
-                const unsigned long id = wcstoul(nameBuf, nullptr, 10);
-                if (id == 0 || id > UINT32_MAX || static_cast<AppId_t>(id) == excludeAppId) continue;
-                if (ReadDonor(DonorKind::Registry, static_cast<AppId_t>(id), out)) {
-                    RegCloseKey(hApps);
+                wchar_t nameBuf[32];
+                for (DWORD index = 0;; ++index) {
+                    DWORD nameLen = static_cast<DWORD>(std::size(nameBuf));
+                    if (RegEnumKeyExW(hApps, index, nameBuf, &nameLen, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
+                        break;
+                    }
+                    const unsigned long id = wcstoul(nameBuf, nullptr, 10);
+                    if (id == 0 || id > UINT32_MAX || static_cast<AppId_t>(id) == excludeAppId) continue;
+                    const AppId_t cand = static_cast<AppId_t>(id);
+                    std::vector<uint8_t> ticket;
+                    if (!ReadDonor(DonorKind::Registry, cand, excludeAppId, ticket)) continue;
+                    if (requireOwn && (activeAccount == 0 || DonorAccountId(ticket) != activeAccount)) continue;
+                    out = std::move(ticket);
+                    donorAppId = cand;
                     g_donorKind = DonorKind::Registry;
-                    g_donorAppId = static_cast<AppId_t>(id);
-                    donorAppId = static_cast<AppId_t>(id);
-                    LOG_INFO("FindDonorAppTicket: donor ticket found in registry: appid={} ({} bytes)", donorAppId, out.size());
+                    g_donorAppId = cand;
+                    RegCloseKey(hApps);
+                    LOG_INFO("ForgeLocalAppOwnershipTicket: forge donor from registry appid={} ({} bytes, own_ticket={})",
+                             cand, out.size(), requireOwn);
                     return true;
                 }
+                RegCloseKey(hApps);
+                return false;
+            };
+
+            if (activeAccount != 0) {
+                if (TryMemCandidates(true)) return true;
+                if (TryLocalConfig()) return true;
+                if (TryRegistry(true)) return true;
             }
-            RegCloseKey(hApps);
+            if (TryMemCandidates(false)) return true;
+            if (TryRegistry(false)) return true;
+
             return false;
         }
 
@@ -127,12 +321,14 @@ namespace AppTicket {
 
     std::vector<uint8_t> GetCachedAppOwnershipTicket(AppId_t appId) {
         if (appId == 0) return {};
-        std::shared_lock lock(g_ticketMutex);
-        auto it = g_tickets.find(appId);
-        if (it != g_tickets.end() && !it->second.appTicket.empty()) {
-            LOG_INFO("Successfully retrieved App Ownership Ticket, AppId: {}, Ticket Size: {}",
-                     appId, it->second.appTicket.size());
-            return it->second.appTicket;
+        {
+            std::shared_lock lock(g_ticketMutex);
+            auto it = g_tickets.find(appId);
+            if (it != g_tickets.end() && !it->second.appTicket.empty()) {
+                LOG_INFO("Successfully retrieved App Ownership Ticket, AppId: {}, Ticket Size: {}",
+                         appId, it->second.appTicket.size());
+                return it->second.appTicket;
+            }
         }
         auto credTicket = GetAppOwnershipTicketFromCredentialStore(appId);
         if (!credTicket.empty()) {
@@ -237,12 +433,14 @@ namespace AppTicket {
 
     std::vector<uint8_t> GetCachedEncryptedTicket(AppId_t appId) {
         if (appId == 0) return {};
-        std::shared_lock lock(g_ticketMutex);
-        auto it = g_tickets.find(appId);
-        if (it != g_tickets.end() && !it->second.eTicket.empty()) {
-            LOG_INFO("Successfully retrieved Encrypted App Ticket, AppId: {}, Ticket Size: {}",
-                     appId, it->second.eTicket.size());
-            return it->second.eTicket;
+        {
+            std::shared_lock lock(g_ticketMutex);
+            auto it = g_tickets.find(appId);
+            if (it != g_tickets.end() && !it->second.eTicket.empty()) {
+                LOG_INFO("Successfully retrieved Encrypted App Ticket, AppId: {}, Ticket Size: {}",
+                         appId, it->second.eTicket.size());
+                return it->second.eTicket;
+            }
         }
         auto credTicket = GetEncryptedTicketFromCredentialStore(appId);
         if (!credTicket.empty()) {

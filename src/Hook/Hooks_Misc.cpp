@@ -108,8 +108,10 @@ namespace {
         {
             // By default, keep real AppID so games can find their save files and authenticate.
             // Only flip GetAppID to 480 if user explicitly passes -p2pflip.
+            // If user explicitly passes upstream's -realappid flag, keep real AppID.
             const bool explicitFlip = PipeManager::DenuvoAuth::HasCmdLineArg(cmdLine, "-p2pflip");
-            const bool suppress = !explicitFlip;
+            const bool explicitReal = PipeManager::DenuvoAuth::HasCmdLineArg(cmdLine, "-realappid");
+            const bool suppress = explicitReal || !explicitFlip;
             g_NetworkingSocketsActive.store(false, std::memory_order_release);
             g_SuppressAppIdFlip.store(suppress, std::memory_order_release);
             g_OnlineFixRealAppId.store(appId, std::memory_order_release);
@@ -281,9 +283,9 @@ namespace Hooks_Misc {
         if (g_OnlineFixRealAppId.load(std::memory_order_acquire) != 0) {
             if (!g_NetworkingSocketsActive.exchange(true, std::memory_order_acq_rel)) {
                 if (g_SuppressAppIdFlip.load(std::memory_order_acquire)) {
-                    LOG_MISC_INFO("NetworkingSockets active: keeping real appid {}", g_OnlineFixRealAppId.load(std::memory_order_acquire));
+                    LOG_MISC_INFO("NetworkingSockets active: keeping real appid {} (-realappid / default)", g_OnlineFixRealAppId.load(std::memory_order_acquire));
                 } else {
-                    LOG_MISC_INFO("NetworkingSockets active: GetAppID now reports 480 for cert match");
+                    LOG_MISC_INFO("NetworkingSockets active: GetAppID now reports 480 for cert match (-p2pflip)");
                 }
             }
         }

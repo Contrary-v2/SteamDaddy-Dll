@@ -151,7 +151,11 @@ namespace {
                     if (currentAppId == 0 && pipe) {
                         currentAppId = PipeManager::DenuvoAuth::GetAuthorizedAppId(pipe);
                     }
-                    if ((currentAppId != 0 && LuaConfig::HasDepot(currentAppId, false)) || Hooks_Misc::IsOnlineFixActive()) {
+                    // For OnlineFix games: only allow handlers when the app is in Lua config.
+                    // Exception: IClientUtils::GetAppID may pass through (handled by ShouldReportOnlineFixAppId).
+                    // Allowing all handlers when IsOnlineFixActive() causes genuine games to have
+                    // their ownership tickets forged/overridden, breaking multiplayer (Capcom Error 54).
+                    if (currentAppId != 0 && LuaConfig::HasDepot(currentAppId, false)) {
                         LOG_IPC_TRACE("Resolved IPC handler: {} {}", pipe->DebugString(), handler->DebugString());
                         if (handler->pre)
                             handler->pre(pipe, pRead, pWrite);
