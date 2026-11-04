@@ -78,6 +78,8 @@ namespace {
     NoDestructor<std::unordered_set<AppId_t>>   g_sharedLicenses;
     std::atomic<bool>                           g_hasSharedLicenses{false};
     std::atomic<Hooks_Package::LicenseChangeObserver> g_licenseChangeObserver{nullptr};
+    std::mutex                                  g_familySharedOwnersMutex;
+    NoDestructor<std::unordered_map<AppId_t, AccountID_t>> g_familySharedOwners;
 
     constexpr PackageId_t kInjectedPackageId = 0;
     constexpr uint64_t kInjectedPkgAccessToken = 10660652434190618804ull;
@@ -196,55 +198,6 @@ namespace {
     }
 
 
-    [[nodiscard]] bool AppendUniqueDepotIdsToPackage(PackageInfo* pPkg,
-                                                     std::span<const DepotId_t> candidateIds,
-                                                     uint32_t* outAddedCount = nullptr) {
-        if (outAddedCount) {
-            *outAddedCount = 0;
-        }
-        if (!pPkg || candidateIds.empty()) {
-            return true;
-        }
-
-        const DepotId_t* existingData = pPkg->DepotIdVec.m_Memory.m_pMemory;
-        const uint32 existingSize = existingData ? pPkg->DepotIdVec.m_Size : 0u;
-        const std::span<const DepotId_t> existingSpan(existingData, existingSize);
-
-        std::vector<DepotId_t> toAdd;
-        toAdd.reserve(candidateIds.size());
-        for (DepotId_t id : candidateIds) {
-            if (id == 0 || id == k_uAppIdInvalid) {
-                continue;
-            }
-            if (LuaConfig::IsOwned(id)) {
-                continue;
-            }
-            if (std::ranges::find(existingSpan, id) == existingSpan.end() &&
-                std::ranges::find(toAdd, id) == toAdd.end()) {
-                toAdd.push_back(id);
-            }
-        }
-
-        if (toAdd.empty()) {
-            return true;
-        }
-
-        const uint32 oldSize = existingSize;
-        const uint32 numToAdd = static_cast<uint32>(toAdd.size());
-        if (!CUtlMemoryGrowWrap(&pPkg->DepotIdVec, numToAdd)) {
-            return false;
-        }
-
-        for (uint32 i = 0; i < numToAdd; ++i) {
-            pPkg->DepotIdVec.m_Memory.m_pMemory[oldSize + i] = toAdd[i];
-        }
-        pPkg->DepotIdVec.m_Size = oldSize + numToAdd;
-        if (outAddedCount) {
-            *outAddedCount = numToAdd;
-        }
-        return true;
-    }
-
     bool InitFakeLicenseOnce(PackageInfo* pPkg) {
         if (!pPkg) {
             return false;
@@ -273,16 +226,6 @@ namespace {
                 }
                 if (addedAppCount > 0) {
                     LOG_PACKAGE_INFO("InitFakeLicense(PackageId={}): added {} apps, oldAppSize={}", kInjectedPackageId, addedAppCount, oldAppSize);
-                }
-
-                const uint32 oldDepotSize = pPkg->DepotIdVec.m_Memory.m_pMemory ? pPkg->DepotIdVec.m_Size : 0u;
-                uint32 addedDepotCount = 0;
-                if (!AppendUniqueDepotIdsToPackage(pPkg, appIds, &addedDepotCount)) {
-                    LOG_PACKAGE_WARN("InitFakeLicense(PackageId={}): failed to grow DepotId vector", kInjectedPackageId);
-                    return false;
-                }
-                if (addedDepotCount > 0) {
-                    LOG_PACKAGE_INFO("InitFakeLicense(PackageId={}): added {} depots, oldDepotSize={}", kInjectedPackageId, addedDepotCount, oldDepotSize);
                 }
             }
 
@@ -390,9 +333,6 @@ namespace {
                     if (pPkg->AppIdVec.m_Memory.m_pMemory) {
                         pPkg->AppIdVec.FindAndFastRemove(appId);
                     }
-                    if (pPkg->DepotIdVec.m_Memory.m_pMemory) {
-                        pPkg->DepotIdVec.FindAndFastRemove(appId);
-                    }
                 }
             }
         } else {
@@ -418,15 +358,31 @@ namespace {
 
         TryProcessPendingLicenseRefresh();
 
+        // Record true lender ID for family shared / borrowed apps so play-state reporting
+        // can restore the authentic owner_id instead of spoofing or masking to 1.
+        if (pOwn && (pOwn->bFamilyShared || pOwn->bBorrowed) && pOwn->SteamId32 != 0) {
+            bool recorded = false;
+            {
+                std::lock_guard<std::mutex> lock(g_familySharedOwnersMutex);
+                AccountID_t& slot = (*g_familySharedOwners)[appId];
+                if (slot != pOwn->SteamId32) {
+                    slot = pOwn->SteamId32;
+                    recorded = true;
+                }
+            }
+            if (recorded) {
+                LOG_PACKAGE_INFO("FamilySharing: recorded lender {} for AppId={} (familyShared={} borrowed={})",
+                                 pOwn->SteamId32, appId, pOwn->bFamilyShared, pOwn->bBorrowed);
+            }
+        }
+
         const auto lc = EvaluateOwnership(result, *pEffectiveOwn);
         RecordLicenseClassification(appId, lc);
         const bool hasValidLicense = lc.isTrulyOwned || lc.isShared;
 
-        if (lc.isShared) {
-            if (pEffectiveOwn->bLicenseLocked) {
-                LOG_PACKAGE_DEBUG("CheckAppOwnership: Clearing bLicenseLocked for shared AppId={}", appId);
-                pEffectiveOwn->bLicenseLocked = false;
-            }
+        // Shared license natural ownership: respect bLicenseLocked if lender is currently playing.
+        // Forcibly clearing bLicenseLocked causes session desync with Valve CM and kicks with 'logged in elsewhere'.
+        if (lc.isShared && !pEffectiveOwn->bLicenseLocked) {
             pEffectiveOwn->bOwnsLicense = true;
             result = true;
         }
@@ -489,6 +445,8 @@ namespace {
                     std::unique_lock wlock(g_sharedLicensesMutex);
                     g_sharedLicenses->clear();
                     g_hasSharedLicenses.store(false, std::memory_order_release);
+                    std::lock_guard<std::mutex> flock(g_familySharedOwnersMutex);
+                    g_familySharedOwners->clear();
                 }
             }
         }
@@ -616,13 +574,6 @@ namespace Hooks_Package {
                     }
                 }
             }
-            if (pPkg->DepotIdVec.m_Memory.m_pMemory) {
-                for (AppId_t id : netRemovals) {
-                    while (pPkg->DepotIdVec.FindAndFastRemove(id)) {
-                        LOG_PACKAGE_DEBUG("NotifyLicenseChanged: removed DepotId {}", id);
-                    }
-                }
-            }
 
             // ── Add depots that are newly loaded ──
             LOG_PACKAGE_DEBUG("NotifyLicenseChanged: processing {} additions", uniqueAdditions.size());
@@ -630,10 +581,6 @@ namespace Hooks_Package {
                 uint32 addedToPkgCount = 0;
                 if (!AppendUniqueAppIdsToPackage(pPkg, uniqueAdditions, &addedToPkgCount)) {
                     LOG_PACKAGE_WARN("NotifyLicenseChanged: failed to grow AppId vector for additions");
-                }
-                uint32 addedDepotCount = 0;
-                if (!AppendUniqueDepotIdsToPackage(pPkg, uniqueAdditions, &addedDepotCount)) {
-                    LOG_PACKAGE_WARN("NotifyLicenseChanged: failed to grow DepotId vector for additions");
                 }
             }
         }
@@ -685,6 +632,13 @@ namespace Hooks_Package {
     void RecordFamilySharedApp(AppId_t appId) {
         if (appId == 0 || appId == k_uAppIdInvalid) return;
         RecordLicenseClassification(appId, { .isTrulyOwned = false, .isShared = true });
+    }
+
+    AccountID_t GetFamilySharedOwner(AppId_t appId) {
+        if (appId == 0) return 0;
+        std::lock_guard<std::mutex> lock(g_familySharedOwnersMutex);
+        auto it = g_familySharedOwners->find(appId);
+        return it == g_familySharedOwners->end() ? 0 : it->second;
     }
 
     void SetLicenseChangeObserver(LicenseChangeObserver observer) noexcept {

@@ -1038,40 +1038,42 @@ namespace Hooks_NetPacket_OwnershipTicket {
 // ════════════════════════════════════════════════════════════════
 namespace Hooks_NetPacket_FamilySharing {
 
-    // Sanitizes FamilyGroupsClient.NotifyRunningApps RPC notification:
-    // Retains the valid family_groupid while clearing running_apps entries to 0.
-    // Steam client receives a structurally sound RPC message informing it that
-    // 0 apps are currently running, actively clearing library lock state.
-    void HandleRecv_NotifyRunningApps(CNetPacket* pPacket, const UnpackedPacket& pkt)
+    // Log incoming Family Sharing StopPlaying notifications (eMsg 9406) without modifying
+    // the packet so Steam client remains in sync with server session state.
+    void LogStopPlaying(const uint8* pBody, uint32 cbBody)
     {
-        if (pkt.body.empty()) {
+        if (!pBody || cbBody == 0) return;
+        CMsgClientSharedLibraryStopPlaying msg;
+        if (!msg.ParseFromArray(pBody, static_cast<int>(cbBody))) {
+            LOG_NETPACKET_WARN("FamilySharing: StopPlaying body unparsable ({} bytes)", cbBody);
             return;
         }
 
-        CFamilyGroupsClient_NotifyRunningApps_Notification notify;
-        if (notify.ParseFromArray(pkt.body.data(), static_cast<int>(pkt.body.size()))) {
-            const int runningCount = notify.running_apps_size();
-            if (runningCount == 0) {
-                return;
-            }
-
-            notify.clear_running_apps();
-
-            if (CommitRecvPacket(pPacket, pkt, nullptr, &notify)) {
-                LOG_NETPACKET_INFO("FamilySharing: Sanitized NotifyRunningApps (family_groupid {}, cleared {} running apps)",
-                                   notify.family_groupid(), runningCount);
-                return;
-            }
+        constexpr int kMaxLogged = 8;
+        std::string detail;
+        for (int i = 0; i < msg.stop_apps_size() && i < kMaxLogged; ++i) {
+            const auto& app = msg.stop_apps(i);
+            if (!detail.empty()) detail += ", ";
+            detail += std::format("app_id={} owner_id={}",
+                                  app.has_app_id() ? app.app_id() : 0,
+                                  app.has_owner_id() ? app.owner_id() : 0);
         }
-
-        LOG_NETPACKET_WARN("FamilySharing: Failed to sanitize NotifyRunningApps, passing through untouched");
+        if (msg.stop_apps_size() > kMaxLogged) {
+            detail += std::format(", ...(+{})", msg.stop_apps_size() - kMaxLogged);
+        }
+        LOG_NETPACKET_INFO("FamilySharing: StopPlaying seconds_left={} stop_apps=[{}]",
+                           msg.has_seconds_left() ? msg.seconds_left() : -1, detail);
     }
 
-    // Clears incoming lock/stop notifications (eMsg 9405 / 9406) to suppress kick timers
-    void ClearBody(CNetPacket* pPacket, const UnpackedPacket& pkt)
+    // Log FamilyGroupsClient.NotifyRunningApps RPC notifications without wiping running_apps
+    // so client state matches Steam server state, avoiding 'logged in elsewhere' kicks.
+    void LogRunningApps(const uint8* pBody, uint32 cbBody)
     {
-        LOG_NETPACKET_DEBUG("FamilySharing: Clearing incoming family sharing lock/stop notification...");
-        (void)CommitRecvPacket(pPacket, pkt, nullptr, nullptr, true);
+        if (!pBody || cbBody == 0) return;
+        CFamilyGroupsClient_NotifyRunningApps_Notification notify;
+        if (!notify.ParseFromArray(pBody, static_cast<int>(cbBody))) return;
+        LOG_NETPACKET_DEBUG("FamilySharing: NotifyRunningApps (family_groupid {}, {} running apps)",
+                            notify.family_groupid(), notify.running_apps_size());
     }
 
 } // namespace Hooks_NetPacket_FamilySharing
@@ -2034,19 +2036,21 @@ namespace Hooks_NetPacket_OnlineFix {
                 }
             }
 
-            // Family sharing concurrency / anti-lock protection:
-            // Mask lender's owner_id to 1 so Steam server does not lock out the lender.
-            // INV-01: Never mask own-account ownership; when localAccountId is 0, only mask confirmed shared licenses.
-            if (game->has_owner_id() && game->owner_id() != 0 && game->owner_id() != 1) {
-                const bool isExternalLender = (localAccountId != 0)
-                    ? (game->owner_id() != localAccountId && !Hooks_Package::IsAppTrulyOwned(appid))
-                    : Hooks_Package::IsSharedLicense(appid);
-                if (isExternalLender) {
-                    LOG_NETPACKET_INFO("FamilySharing: Masking lender owner_id {} -> 1 for game_id {}",
-                                       game->owner_id(), game->game_id());
-                    game->set_owner_id(1);
-                    patched = true;
-                }
+            // Family sharing play-state reporting:
+            // Restore owner_id to the real lender recorded by CheckAppOwnership.
+            // Masking or spoofing owner_id to 1 causes Steam servers to treat the session as
+            // invalid, showing 'logged in elsewhere' and disconnecting after a few minutes.
+            const AccountID_t reported = game->has_owner_id() ? game->owner_id() : 0;
+            const AccountID_t lender = Hooks_Package::GetFamilySharedOwner(appid);
+
+            LOG_NETPACKET_DEBUG("FamilySharing: appid {} reported_owner={} lender_lookup={}",
+                                appid, reported, lender);
+
+            if (lender > 1 && reported != lender) {
+                LOG_NETPACKET_INFO("FamilySharing: Restoring owner_id {} -> {} for game_id {}",
+                                   reported, lender, appid);
+                game->set_owner_id(lender);
+                patched = true;
             }
         }
 
@@ -2624,7 +2628,7 @@ namespace {
         switch (Fnv1aHash(jobView)) {
 
         case HASH_JOB_NotifyRunningApps:
-            Hooks_NetPacket_FamilySharing::HandleRecv_NotifyRunningApps(pPacket, pkt);
+            Hooks_NetPacket_FamilySharing::LogRunningApps(pkt.body.data(), static_cast<uint32>(pkt.body.size()));
             return;
 
         case HASH_JOB_GetUserStats:
@@ -2697,8 +2701,11 @@ namespace {
             return;
 
         case k_EMsgClientSharedLibraryLockStatus:      // 9405
+            LOG_NETPACKET_DEBUG("FamilySharing: received k_EMsgClientSharedLibraryLockStatus (passing through)");
+            return;
+
         case k_EMsgClientSharedLibraryStopPlaying:     // 9406
-            Hooks_NetPacket_FamilySharing::ClearBody(pPacket, pkt);
+            Hooks_NetPacket_FamilySharing::LogStopPlaying(pkt.body.data(), static_cast<uint32>(pkt.body.size()));
             return;
 
         case k_EMsgClientPersonaState:                 // 766

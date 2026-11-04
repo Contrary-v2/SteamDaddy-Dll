@@ -33,4 +33,7 @@ namespace Hooks_Package {
     // Fast-path lockless check if an AppId is recognized as family-shared from official packages
     [[nodiscard]] bool IsSharedLicenseCached(AppId_t appId) noexcept;
     void RecordFamilySharedApp(AppId_t appId);
+
+    // Queries the recorded lender account ID for a family-shared AppId (0 if not borrowed/recorded).
+    [[nodiscard]] AccountID_t GetFamilySharedOwner(AppId_t appId);
 }
