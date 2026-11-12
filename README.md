@@ -92,8 +92,11 @@ Extracts `AppTicket`, `ETicket`, DLC lists, depot keys, manifests, and auto-gene
 * **Spacewar Matchmaking (`-onlinefix`)**: Add `-onlinefix` to Steam launch parameters to enable AppID 480 matchmaking while preserving save isolation and real AppID reporting.
 * **P2P Certificate Flip (`-p2pflip`)**: Add `-onlinefix -p2pflip` for rare multiplayer titles requiring strict 480 certificate matching in P2P handshakes.
 
-### Family Sharing Bypass
-* **Zero-Configuration Bypass**: The lender's library is never locked, and borrowed games lose their borrowed and license-locked status flags.
+### Family Sharing
+* **Default (natural sharing)**: Shared games follow Steam's own rules. The real lender is recorded and reported back in play-state, and a lender who is playing still locks the library.
+* **Concurrent play (`[family_sharing] concurrent_bypass = true`)**: Off by default. For Lua-listed shared games, shared flags are cleared locally and the game is reported to Steam under a placeholder AppID, so you can play at the same time as the lender. Use it if the log shows `ClientLoggedOff: eresult=6` ("logged in elsewhere") kicks.
+  * Cost: achievements, playtime and real presence for those games attach to the fake license. Games you own yourself are never affected.
+  * Restart Steam after changing it.
 
 ### Stats & Achievements
 * **Achievement & Stat Tracking**: Enables statistics and achievements for unlocked unowned games.
@@ -179,6 +182,10 @@ auto_sync_on_update = true
 [stats]
 # Query stats API when setStat is absent
 enable_api = true
+
+[family_sharing]
+# Play Lua-listed shared games while the lender plays (see Family Sharing above)
+concurrent_bypass = false
 
 [lua]
 # Additional Lua directories to load (optional)

@@ -576,7 +576,7 @@ std::vector<OwnedGameInfo> SteamAuthService::FetchOwnedGames(
         LOG_WARN("SteamAuth", MsgKey::LogAuthFetchOwnedGamesFailed, resp.statusCode, resp.errorMessage);
     }
 
-    // 查询当前账号的 Steam 家庭组 (IFamilyGroupsService)
+    // Query the current account's Steam family group (IFamilyGroupsService)
     std::string familyUrl;
     familyUrl.reserve(140 + ComputeUrlEncodedSize(accessToken));
     familyUrl.append("https://api.steampowered.com/IFamilyGroupsService/GetFamilyGroupForUser/v1/?access_token=");

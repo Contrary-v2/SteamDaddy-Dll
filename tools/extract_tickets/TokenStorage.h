@@ -17,8 +17,8 @@ struct CachedAccount {
     std::string refreshToken;
     std::string accessToken;
     int64_t lastLoginTime{0};
-    bool isInvalid{false};       // 字段 6: 是否已被服务端证实失效 (DPAPI 持久化)
-    std::string alias;           // 字段 7: 用户自定义多语言备注标签
+    bool isInvalid{false};       // field 6: confirmed invalid by the server (persisted via DPAPI)
+    std::string alias;           // field 7: user-defined multi-language note label
 
     CachedAccount() = default;
     ~CachedAccount() noexcept {

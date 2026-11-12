@@ -1210,13 +1210,13 @@ int OnlineSession::RunSilent(uint32_t appId, const std::string& accountName, boo
                                              [](const DepotKeyInfo& k) { return !k.hexKey.empty(); });
 
             if (hasTicket || hasKeys || !accountName.empty() || candidates.size() == 1) {
-                // 当前账号拥有正版授权，或者为用户显式指定/唯一账号
+                // The current account owns the genuine game license, or was explicitly specified / is the only account
                 activeAcc = curAcc;
                 creds = std::move(curCreds);
                 break;
             }
 
-            // 当前账号未拥有目标游戏正版授权（无票据且无密钥）
+            // The current account does not own the genuine game license (no ticket and no key)
             if (!fallbackCreds.has_value()) {
                 fallbackCreds = std::move(curCreds);
                 fallbackAcc = curAcc;

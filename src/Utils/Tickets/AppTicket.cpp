@@ -30,8 +30,8 @@ namespace AppTicket {
             return head != 0;
         }
 
-        // 票里 SteamID 的低 32 位就是账号 ID，用它认出这张票是谁的。
-        // 布局与 GetSpoofSteamID 一致：[Size][Version][SteamID]。
+        // The low 32 bits of the SteamID in the ticket are the account ID; use it to tell whose ticket this is.
+        // Layout matches GetSpoofSteamID: [Size][Version][SteamID].
         static uint32_t DonorAccountId(const std::vector<uint8_t>& t) {
             if (t.size() < kSteamIdTicketMinimumSize) return 0;
             uint64_t steamId = 0;
@@ -39,8 +39,8 @@ namespace AppTicket {
             return static_cast<uint32_t>(steamId & 0xFFFFFFFFull);
         }
 
-        // 当前登录账号。拿不到时返回 0，调用方据此退回纯结构校验。
-        // 切号必然重启 Steam，进程内不会有第二个值，不需要缓存失效逻辑。
+        // The currently logged-in account. Returns 0 when unavailable; the caller then falls back to a pure structural check.
+        // Switching accounts always restarts Steam, so the process never sees a second value and no cache invalidation is needed.
         static uint32_t ActiveAccountId() {
             uint32_t accountId = 0;
             std::wstring universe;

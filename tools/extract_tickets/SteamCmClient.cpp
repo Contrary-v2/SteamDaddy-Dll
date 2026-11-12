@@ -1384,7 +1384,7 @@ ExtractedAppCredentials SteamCmClient::ExtractFullCredentials(uint32_t appId, bo
     ExtractedAppCredentials creds;
     creds.appId = appId;
 
-    // 1. AppOwnershipTicket (纯净拉取，自主拥有与家庭共享在无会话状态下原生直接下发)
+    // 1. AppOwnershipTicket (clean fetch: owned and family-shared apps are delivered natively without session state)
     LOG_DEBUG("SteamCM", MsgKey::LogCmFullReqOwnership, appId);
     if (!TuiEngine::IsActive()) {
         std::cout << TR(MsgKey::CliExtractRequestTicket) << "\n";
@@ -1399,7 +1399,7 @@ ExtractedAppCredentials SteamCmClient::ExtractFullCredentials(uint32_t appId, bo
         LOG_INFO("SteamCM", MsgKey::LogCmFullNoOwnershipFallback);
     }
 
-    // 2. 纯官方云端向 Steam CM PICS 请求完整产品元数据 (包含全部 Depots、清单号、所有 DLC 列表与 DRM 标记)
+    // 2. Request full product metadata from the official Steam CM PICS (all depots, manifest ids, all DLC, DRM flags)
     if (onProgress) {
         onProgress("meta", 0, 0, 0);
     }
@@ -1416,7 +1416,7 @@ ExtractedAppCredentials SteamCmClient::ExtractFullCredentials(uint32_t appId, bo
     LOG_DEBUG("SteamCM", MsgKey::LogCmFullReqPicsMeta, appId, MaskPicsToken(appToken));
     auto appInfoData = RequestPicsProductInfo(appId, appToken);
 
-    // 3. EncryptedAppTicket (纯 CM 原生会话裁决: 无需外部网页爬虫或静态名单，直接向 Valve CM 原生索取)
+    // 3. EncryptedAppTicket (native CM session verdict: ask the Valve CM directly, no external scraper or static list)
     {
         creds.encryptedAppTicket = RequestEncryptedAppTicket(appId);
         if (creds.encryptedAppTicket) {
@@ -1428,11 +1428,11 @@ ExtractedAppCredentials SteamCmClient::ExtractFullCredentials(uint32_t appId, bo
                 appInfoData->requiresDenuvo = true;
             }
         } else {
-            // 普通单机游戏或未配置加密票据密钥的游戏，CM 原生返回 Fail(2)，优雅静默跳过
+            // Ordinary single-player games, or games without an encrypted-ticket key configured, get Fail(2) from the CM; skip quietly
             LOG_DEBUG("SteamCM", MsgKey::LogCmFullSkipEticketSession);
         }
 
-        // 极端边界兜底：若前置未拿到所有权票据，在会话中顺带重试一次
+        // Edge-case fallback: if no ownership ticket was obtained earlier, retry once within the session
         if (!creds.appOwnershipTicket) {
             creds.appOwnershipTicket = RequestAppOwnershipTicket(appId);
             if (creds.appOwnershipTicket) {
@@ -1461,7 +1461,7 @@ ExtractedAppCredentials SteamCmClient::ExtractFullCredentials(uint32_t appId, bo
         LOG_INFO("SteamCM", MsgKey::LogCmFullGotAppInfoSummary,
                  appInfoData->depots.size(), appInfoData->dlcAppIds.size());
 
-        // 4.1 识别所有 DLC（包含无独立 Depot 的逻辑 DLC，例如季票、豪华版升级包、皮肤包、原声音乐等）
+        // 4.1 Identify all DLC (including logical DLC without their own depot, e.g. season passes, deluxe upgrades, skin packs, soundtracks)
         for (uint32_t dlcId : appInfoData->dlcAppIds) {
             if (dlcId != appId && !knownDlcSet.contains(dlcId)) {
                 knownDlcSet.insert(dlcId);
@@ -1471,7 +1471,7 @@ ExtractedAppCredentials SteamCmClient::ExtractFullCredentials(uint32_t appId, bo
             }
         }
 
-        // 4.2 提取官方 Depot 与关联清单 ID (GID)
+        // 4.2 Extract official depots and their manifest ids (GID)
         for (const auto& dInfo : appInfoData->depots) {
             if (dInfo.dlcId > 0 && dInfo.dlcId != appId && !knownDlcSet.contains(dInfo.dlcId)) {
                 knownDlcSet.insert(dInfo.dlcId);
@@ -1498,7 +1498,7 @@ ExtractedAppCredentials SteamCmClient::ExtractFullCredentials(uint32_t appId, bo
             }
         }
 
-        // 4.3 批量拉取全部 DLC 与原声音乐的 PICS 产品元数据（彻底解析 DLC 内部专属 Depot 与清单）
+        // 4.3 Batch-fetch PICS metadata for all DLC and soundtracks (fully resolve DLC-specific depots and manifests)
         std::vector<uint32_t> dlcsToQuery;
         for (uint32_t dlcId : appInfoData->dlcAppIds) {
             if (dlcId != appId) {
@@ -1517,7 +1517,7 @@ ExtractedAppCredentials SteamCmClient::ExtractFullCredentials(uint32_t appId, bo
 
             auto dlcAppInfos = RequestPicsProductInfoBatch(dlcsToQuery, dlcTokens);
             for (auto& dlcParsed : dlcAppInfos) {
-                // 回填官方名称
+                // Backfill official names
                 const std::string& dName = !dlcParsed.localizedName.empty() ? dlcParsed.localizedName : dlcParsed.name;
                 if (!dName.empty()) {
                     auto it = std::find_if(creds.dlcs.begin(), creds.dlcs.end(),
@@ -1527,7 +1527,7 @@ ExtractedAppCredentials SteamCmClient::ExtractFullCredentials(uint32_t appId, bo
                     }
                 }
 
-                // 提取 DLC 专属物理 Depot 与清单 GID（强制继承 DLC 归属）
+                // Extract DLC-specific physical depots and manifest GIDs (force inheritance of DLC ownership)
                 for (const auto& dInfo : dlcParsed.depots) {
                     const uint32_t assocDlc = (dInfo.dlcId > 0) ? dInfo.dlcId : dlcParsed.appId;
                     auto it = std::find_if(depotKeys.begin(), depotKeys.end(),
@@ -1550,15 +1550,15 @@ ExtractedAppCredentials SteamCmClient::ExtractFullCredentials(uint32_t appId, bo
             }
         }
 
-        // 4.4 纯官方云端向 Steam CM 查询真实物理 Depot 解密密钥 (先验授权鉴定，杜绝后续清单盲目撞门)
+        // 4.4 Ask the official Steam CM for the real physical depot decryption keys (authorization check first, so later manifest requests do not blindly knock)
         std::vector<DepotKeyQuery> depotQueries;
         std::unordered_set<uint32_t> queriedDepotIds;
         for (const auto& dk : depotKeys) {
-            // 严格剔除无独立 Depot 的纯逻辑 DLC 容器 (dlcId == depotId 或属于已知 DLC AppID 且无清单)
+            // Strictly drop purely logical DLC containers without their own depot (dlcId == depotId, or a known DLC AppID with no manifest)
             if (dk.manifestId.empty() && (dk.depotId == dk.dlcId || knownDlcSet.contains(dk.depotId))) {
                 continue;
             }
-            // 严格剔除无任何有效清单的非 base 游戏条目 (未发布/已弃用/仅存在于私有分支的 Depot)
+            // Strictly drop non-base entries without any valid manifest (unreleased, deprecated, or private-branch-only depots)
             if (dk.manifestId.empty() && dk.depotId != appId) {
                 continue;
             }
@@ -1606,7 +1606,7 @@ ExtractedAppCredentials SteamCmClient::ExtractFullCredentials(uint32_t appId, bo
             }
         }
 
-        // 4.4 针对已授权物理 Depot 拉取官方清单文件 (免撞门两阶段流水线: CM 请求码收集 + 异步并发 CDN 下载)
+        // 4.4 Fetch official manifest files for authorized physical depots (two-phase pipeline: CM request-code collection + async concurrent CDN download)
         LOG_INFO("SteamCM", MsgKey::LogCmFullPullingManifests, authorizedDepots.size(), depotQueries.size());
         if (!TuiEngine::IsActive()) {
             std::cout << TR(MsgKey::CliExtractPullManifests) << "\n";
@@ -1614,13 +1614,13 @@ ExtractedAppCredentials SteamCmClient::ExtractFullCredentials(uint32_t appId, bo
 
         for (auto& dk : depotKeys) {
             if (IsValidManifestId(dk.manifestId)) {
-                // 彻底杜绝撞门：仅对确认已授权的物理 Depot 请求清单
+                // No blind knocking: only request manifests for depots confirmed as authorized
                 if (!authorizedDepots.contains(dk.depotId)) {
                     LOG_DEBUG("SteamCM", MsgKey::LogCmFullSkipUnauthorizedDepot, dk.depotId);
                     continue;
                 }
 
-                // 本地磁盘快速检查：若已存在则直接秒级复用，完全跳过网络查询
+                // Local disk fast path: reuse immediately if the file already exists, skipping all network queries
                 std::string fileName = std::format("{}_{}.manifest", dk.depotId, dk.manifestId);
                 std::filesystem::path localPath = Utf8Path(outDir) / fileName;
                 const std::string localPathUtf8 = PathToUtf8(localPath);
@@ -1681,7 +1681,7 @@ ExtractedAppCredentials SteamCmClient::ExtractFullCredentials(uint32_t appId, bo
             });
         }
 
-        // 4.5 纯官方云端批量解析所有 DLC 名称 (Steam CM PICS 公开元数据查询)
+        // 4.5 Resolve all DLC names from the official cloud in batch (public Steam CM PICS metadata query)
         std::vector<uint32_t> missingDlcNames;
         for (const auto& d : creds.dlcs) {
             if (d.name.empty()) {
@@ -1701,7 +1701,7 @@ ExtractedAppCredentials SteamCmClient::ExtractFullCredentials(uint32_t appId, bo
                 }
             }
 
-            // 4.6 DLC 纯逻辑合法性认证与幽灵包切除门禁 (防误杀熔断 + 严格物理/元数据双空判定)
+            // 4.6 DLC logical-validity check and phantom-package pruning gate (false-kill fuse + strict empty physical/metadata test)
             if (picsBatchOk) {
                 std::vector<uint32_t> purgedGhostIds;
                 std::erase_if(creds.dlcs, [&](const DlcInfo& dlc) {
@@ -1729,7 +1729,7 @@ ExtractedAppCredentials SteamCmClient::ExtractFullCredentials(uint32_t appId, bo
         }
     }
 
-    // 5. 纯官方云端增量查询 64 位 PICS AccessTokens (AppID + 全部 DLC)
+    // 5. Incrementally query 64-bit PICS AccessTokens from the official cloud (AppID + all DLC)
     if (onProgress) {
         onProgress("tokens", 0, 0, 0);
     }
@@ -1766,7 +1766,7 @@ ExtractedAppCredentials SteamCmClient::ExtractFullCredentials(uint32_t appId, bo
         }
     }
 
-    // 6. 等待并发 CDN 清单拉取任务收尾并合并路径结果
+    // 6. Wait for concurrent CDN manifest download tasks to finish and merge the resulting paths
     if (manifestFuture.valid()) {
         if (onProgress) {
             onProgress("manifests_start", 0, downloadTasks.size(), 0);
@@ -1789,7 +1789,7 @@ ExtractedAppCredentials SteamCmClient::ExtractFullCredentials(uint32_t appId, bo
         std::cout << TR_FMT(MsgKey::CliExtractManifestsGot, downloadedManifests) << "\n";
     }
 
-    // 剔除无有效密钥、无清单文件且无有效清单ID的空项
+    // Drop empty entries that have no valid key, no manifest file and no valid manifest id
     std::erase_if(depotKeys, [](const DepotKeyInfo& dk) {
         return dk.hexKey.empty() && dk.manifestFilePath.empty() && !IsValidManifestId(dk.manifestId);
     });
@@ -1807,7 +1807,7 @@ ExtractedAppCredentials SteamCmClient::ExtractFullCredentials(uint32_t appId, bo
         }
     }
 
-    // 7. 全部凭据与清单提取完成
+    // 7. All credentials and manifests extracted
     if (onProgress) {
         onProgress("done", downloadedManifests, downloadTasks.size(), 0);
     }

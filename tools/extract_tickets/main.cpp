@@ -633,7 +633,7 @@ int Run(int argc, char** argv) {
 
 int main(int argc, char** argv) {
 #if !defined(_WIN64)
-    std::cerr << "[ERROR] extract_tickets 必须编译为 64 位 Windows 程序。\n"
+    std::cerr << "[ERROR] extract_tickets must be built as a 64-bit Windows program.\n"
               << "        extract_tickets must be built as a 64-bit Windows executable.\n";
     return 1;
 #else

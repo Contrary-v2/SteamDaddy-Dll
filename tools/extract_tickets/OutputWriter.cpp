@@ -313,7 +313,7 @@ bool WriteOutputs(uint32_t appId,
             if (hasPhysicalDepot) {
                 physicalDlcIndices.push_back(i);
             } else {
-                // 纵深防御：对于既无物理实体又无公开名称的孤立空项直接跳过
+                // Defense in depth: skip orphan empty entries with neither a physical manifest nor a public name
                 if (dlc.name.empty()) {
                     LOG_DEBUG("OutputWriter", MsgKey::LogOutDroppedOrphanGhostDlc, dlc.dlcId);
                     continue;

@@ -355,7 +355,7 @@ std::vector<DepotKeyInfo> ExtractDepotDecryptionKeys(
     if (!steamPath.empty()) {
         auto appInfoOpt = ParseAppInfoDepots(steamPath, appId);
         if (appInfoOpt) {
-            // 仅对本体及已确认拥有的 DLC 补充官方清单 GID，严禁将全量商店公共商品目录 (listofdlc) 倒灌入已拥有列表
+            // Only supplement official manifest GIDs for the base app and DLC confirmed as owned; never pour the full public store catalog (listofdlc) into the owned list
             for (const auto& dInfo : appInfoOpt->depots) {
                 const bool isBaseGameDepot = (dInfo.dlcId == 0 || dInfo.dlcId == appId);
                 const bool isOwnedDlcDepot = (dInfo.dlcId > 0 && knownDlcIds.contains(dInfo.dlcId));
@@ -389,7 +389,7 @@ std::vector<DepotKeyInfo> ExtractDepotDecryptionKeys(
         }
     }
 
-    // 本地模式对称提纯：剔除既无物理清单/密钥又无有效名称的幽灵 DLC
+    // Symmetric purge in local mode: drop phantom DLC that have no physical manifest/key and no valid name
     std::erase_if(dlcMap, [&](const auto& item) {
         const auto& [id, d] = item;
         const bool hasPhysicalDepot = (knownDepotManifests.contains(id) && !knownDepotManifests[id].empty()) ||
