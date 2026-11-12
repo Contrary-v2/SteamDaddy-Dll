@@ -89,6 +89,15 @@ auto_sync_on_update = true
 # Priority: setStat > stats API when enabled and valid > hardcoded preset SteamID.
 enable_api = true
 
+[family_sharing]
+# Lets you play a Lua-listed family-shared game at the same time as its lender.
+# Use it if Steam kicks you with "logged in elsewhere" (see ClientLoggedOff
+# eresult=6 in the log). Shared flags are cleared locally and the game is
+# reported to Steam under a placeholder appid.
+# Cost: achievements, playtime and real presence for those games attach to the
+# fake license. Games you own yourself are never affected. Restart Steam after changing.
+concurrent_bypass = false
+
 # Additional Lua config directories (optional).
 # Files are loaded after the default <Steam>/config/stplug-in folder.
 # The default folder is always loaded last so user files take priority.

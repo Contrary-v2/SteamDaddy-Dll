@@ -55,4 +55,9 @@ inline const char* GetStorageDirectory() noexcept {
 // The fake AppId used by -onlinefix (SpaceWar).
 constexpr AppId_t kOnlineFixAppId = 480;
 
+// Placeholder appid reported to Steam for family-shared games when
+// [family_sharing] concurrent_bypass is on. The server has no such app, so it
+// neither counts the lender's slot nor sends stop-playing notices.
+constexpr AppId_t kFamilySharedMaskAppId = 0x7FFFFFFF;
+
 #endif // DLLMAIN_H

@@ -36,4 +36,8 @@ namespace Hooks_Package {
 
     // Queries the recorded lender account ID for a family-shared AppId (0 if not borrowed/recorded).
     [[nodiscard]] AccountID_t GetFamilySharedOwner(AppId_t appId);
+
+    // True when [family_sharing] concurrent_bypass is on and this Lua-listed app is family shared.
+    // Play-state reports for it must use the placeholder appid (kFamilySharedMaskAppId).
+    [[nodiscard]] bool IsFamilySharedBypassed(AppId_t appId);
 }

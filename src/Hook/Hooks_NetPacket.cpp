@@ -2035,6 +2035,22 @@ namespace Hooks_NetPacket_OnlineFix {
                 }
             }
 
+            // [family_sharing] concurrent_bypass: report a placeholder appid the server
+            // does not know, so it neither books the lender's slot nor sends stop-playing
+            // notices. The local presence/cloud tracking above still uses the real appid.
+            if (Hooks_Package::IsFamilySharedBypassed(appid)) {
+                CGameID masked{};
+                masked.m_ulGameID = game->game_id();
+                masked.SetAppID(kFamilySharedMaskAppId);
+                game->set_game_id(masked.m_ulGameID);
+                game->clear_game_extra_info();
+                game->clear_owner_id();
+                patched = true;
+                LOG_NETPACKET_INFO("FamilySharing: concurrent_bypass reporting appid {} as placeholder {}",
+                                   appid, kFamilySharedMaskAppId);
+                continue;
+            }
+
             // Family sharing play-state reporting:
             // Restore owner_id to the real lender recorded by CheckAppOwnership.
             // Masking or spoofing owner_id to 1 causes Steam servers to treat the session as

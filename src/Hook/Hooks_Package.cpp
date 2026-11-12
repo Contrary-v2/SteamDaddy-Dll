@@ -3,6 +3,7 @@
 #include "Hooks_Misc.h"
 #include "Steam/Enums.h"
 #include "Steam/Structs.h"
+#include "Utils/Config/Config.h"
 #include "Utils/Config/LuaConfig.h"
 #include "Utils/HookSupport/VehCommon.h"
 #include "Utils/Logging/Log.h"
@@ -285,8 +286,20 @@ namespace {
         return {};
     }
 
+    // [family_sharing] concurrent_bypass: a Lua-listed app that Steam reports as family
+    // shared is handled as a plain fake license (shared flags cleared, never cached as
+    // shared) so the server never tracks it against the lender's session.
+    // Self-owned apps are excluded by HasDepot(appId, true).
+    inline bool ShouldBypassShared(AppId_t appId) {
+        return Config::GetFamilySharingConcurrentBypass() && LuaConfig::HasDepot(appId, true);
+    }
+
     inline void RecordLicenseClassification(AppId_t appId, const LicenseClassification& lc) {
         if (appId == 0 || appId == k_uAppIdInvalid) {
+            return;
+        }
+
+        if (lc.isShared && !lc.isTrulyOwned && ShouldBypassShared(appId)) {
             return;
         }
 
@@ -378,11 +391,13 @@ namespace {
 
         const auto lc = EvaluateOwnership(result, *pEffectiveOwn);
         RecordLicenseClassification(appId, lc);
-        const bool hasValidLicense = lc.isTrulyOwned || lc.isShared;
+        const bool bypassShared = lc.isShared && !lc.isTrulyOwned && ShouldBypassShared(appId);
+        const bool hasValidLicense = lc.isTrulyOwned || (lc.isShared && !bypassShared);
 
         // Shared license natural ownership: respect bLicenseLocked if lender is currently playing.
         // Forcibly clearing bLicenseLocked causes session desync with Valve CM and kicks with 'logged in elsewhere'.
-        if (lc.isShared && !pEffectiveOwn->bLicenseLocked) {
+        // (Skipped when concurrent_bypass is on: the fake-license path below takes over.)
+        if (lc.isShared && !bypassShared && !pEffectiveOwn->bLicenseLocked) {
             pEffectiveOwn->bOwnsLicense = true;
             result = true;
         }
@@ -487,6 +502,7 @@ namespace {
         bool result = origCheckAppOwnership(pUser, appId, &own);
         const auto lc = EvaluateOwnership(result, own);
         RecordLicenseClassification(appId, lc);
+        if (lc.isShared && !lc.isTrulyOwned && ShouldBypassShared(appId)) return {};
         return lc;
     }
 }
@@ -639,6 +655,11 @@ namespace Hooks_Package {
         std::lock_guard<std::mutex> lock(g_familySharedOwnersMutex);
         auto it = g_familySharedOwners->find(appId);
         return it == g_familySharedOwners->end() ? 0 : it->second;
+    }
+
+    bool IsFamilySharedBypassed(AppId_t appId) {
+        // A lender record exists only for apps Steam reported as shared/borrowed.
+        return appId != 0 && GetFamilySharedOwner(appId) != 0 && ShouldBypassShared(appId);
     }
 
     void SetLicenseChangeObserver(LicenseChangeObserver observer) noexcept {

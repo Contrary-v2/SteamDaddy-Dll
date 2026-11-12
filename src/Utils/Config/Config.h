@@ -47,6 +47,10 @@ namespace Config {
     [[nodiscard]] std::string GetRemoteOrder();
     [[nodiscard]] CloudSettings GetCloudSettings();
     [[nodiscard]] bool GetStatsEnableApi();
+    // [family_sharing] concurrent_bypass: Lua-listed family-shared games are treated as
+    // fake-licensed and reported to Steam under a placeholder appid, so the lender and
+    // borrower can play at the same time. Off by default (costs achievements/playtime).
+    [[nodiscard]] bool GetFamilySharingConcurrentBypass();
     [[nodiscard]] std::vector<InjectDll> GetInjectDlls();
     [[nodiscard]] bool GetManifestLockOwnedGames();
     [[nodiscard]] bool GetManifestAutoSyncOnUpdate();

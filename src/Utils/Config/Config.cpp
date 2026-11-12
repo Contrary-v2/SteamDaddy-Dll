@@ -32,6 +32,7 @@ namespace {
         CloudSettings cloud;
         bool manifestLockOwnedGames = false;
         bool manifestAutoSyncOnUpdate = true;
+        bool familySharingConcurrentBypass = false;
     };
 
     std::shared_mutex g_mutex;
@@ -52,6 +53,7 @@ namespace {
     std::string cloudLibrary;
     bool manifestLockOwnedGames = false;
     bool manifestAutoSyncOnUpdate = true;
+    bool familySharingConcurrentBypass = false;
 
     const char* ToString(LogLevel level) {
         switch (level) {
@@ -105,6 +107,7 @@ namespace {
         cloudLibrary           = snapshot.cloud.library;
         manifestLockOwnedGames = snapshot.manifestLockOwnedGames;
         manifestAutoSyncOnUpdate = snapshot.manifestAutoSyncOnUpdate;
+        familySharingConcurrentBypass = snapshot.familySharingConcurrentBypass;
     }
 
     // [PROVIDER-FIX] Accepts the full snapshot so we can wire SetFailoverEnabled
@@ -245,6 +248,13 @@ namespace {
             if (auto stats = tbl["stats"].as_table()) {
                 if (auto val = (*stats)["enable_api"].value<bool>()) {
                     snapshot.statsEnableApi = *val;
+                }
+            }
+
+            // [family_sharing]
+            if (auto fs = tbl["family_sharing"].as_table()) {
+                if (auto val = (*fs)["concurrent_bypass"].value<bool>()) {
+                    snapshot.familySharingConcurrentBypass = *val;
                 }
             }
 
@@ -422,6 +432,11 @@ namespace {
     bool GetStatsEnableApi() {
         std::shared_lock lock(g_mutex);
         return statsEnableApi;
+    }
+
+    bool GetFamilySharingConcurrentBypass() {
+        std::shared_lock lock(g_mutex);
+        return familySharingConcurrentBypass;
     }
 
     CloudSettings GetCloudSettings() {
