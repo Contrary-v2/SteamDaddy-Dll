@@ -155,7 +155,14 @@ namespace {
                     // Exception: IClientUtils::GetAppID may pass through (handled by ShouldReportOnlineFixAppId).
                     // Allowing all handlers when IsOnlineFixActive() causes genuine games to have
                     // their ownership tickets forged/overridden, breaking multiplayer (Capcom Error 54).
-                    if (currentAppId != 0 && LuaConfig::HasDepot(currentAppId, false)) {
+                    // A genuine (non-Lua) game launched with -onlinefix has pipe appid 480,
+                    // so only IClientUtils::GetAppID is let through to restore the real id.
+                    const bool onlineFixAppIdQuery =
+                        Hooks_Misc::IsOnlineFixActive() &&
+                        call.interfaceID() == EIPCInterface::IClientUtils &&
+                        handler->methodName && strcmp(handler->methodName, "GetAppID") == 0;
+                    if (currentAppId != 0 &&
+                        (onlineFixAppIdQuery || LuaConfig::HasDepot(currentAppId, false))) {
                         LOG_IPC_TRACE("Resolved IPC handler: {} {}", pipe->DebugString(), handler->DebugString());
                         if (handler->pre)
                             handler->pre(pipe, pRead, pWrite);
