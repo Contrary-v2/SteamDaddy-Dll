@@ -2691,6 +2691,34 @@ namespace {
             return;
         }
 
+        // The disconnect reason only appears in this packet (field 1 = eresult,
+        // varint). Log it so "got kicked" can be told apart: 6 = logged in
+        // elsewhere, 34 = session replaced, 38 = remote disconnect.
+        case k_EMsgClientLoggedOff: {                  // 757
+            // Conservative decode: read at most 10 bytes and check the shift
+            // before shifting, so malformed input only fails the decode.
+            uint64 eresult = 0;
+            bool decoded = false;
+            const auto body = pkt.body;
+            if (!body.empty() && body[0] == 0x08) {
+                size_t pos = 1;
+                uint32 shift = 0;
+                for (int consumed = 0; consumed < 10 && pos < body.size(); ++consumed) {
+                    const uint8 b = body[pos++];
+                    if (shift < 64) eresult |= static_cast<uint64>(b & 0x7F) << shift;
+                    if (!(b & 0x80)) { decoded = true; break; }
+                    shift += 7;
+                }
+            }
+            if (decoded) {
+                LOG_NETPACKET_INFO("ClientLoggedOff: eresult={} (1=OK 6=logged in elsewhere 34=session replaced 38=remote disconnect)",
+                                   eresult);
+            } else {
+                LOG_NETPACKET_INFO("ClientLoggedOff: eresult not decodable ({} bytes)", body.size());
+            }
+            return;
+        }
+
         case k_EMsgClientGetUserStatsResponse:     // 819
             Hooks_NetPacket_UserStats::HandleRecv_ClientGetUserStatsResponse(pPacket, pkt);
             return;
